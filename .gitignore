@@ -1,0 +1,7 @@
+*.csv
+*.csv.bak
+*.pyc
+/models
+/models/
+/pycache
+/pycache/
