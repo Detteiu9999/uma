@@ -7,8 +7,8 @@ $ErrorActionPreference = "Stop"
 
 # S = 19th column = zero-based index 18
 # AF = 32nd column = zero-based index 31
-$StartIndex = 18
-$EndIndex = 31
+$StartIndex = 21
+$EndIndex = 34
 
 function ConvertTo-CsvField {
     param(

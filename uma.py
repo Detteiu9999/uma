@@ -12,9 +12,9 @@ from datetime import date
 # ============================================================
 
 TARGET_YEARS = [26]
-PLACES = [6,9]
-KAIS = [4]
-DAYS = [3]
+PLACES = range(1,11)
+KAIS = range(1, 13)
+DAYS = range(1, 9)
 RACES = range(1, 13)
 
 BASE_URL = "https://jiro8.sakura.ne.jp/index.php?code="
@@ -23,7 +23,7 @@ CSV_PREFIX = "horse_racing_data"
 # 既存CSVに今回追加する列がなければ、そのレースを再取得するか
 RESCRAPE_IF_COLUMNS_MISSING = True
 
-REQUEST_INTERVAL_SECONDS = 1
+REQUEST_INTERVAL_SECONDS = 0.5
 
 
 # ============================================================
@@ -157,7 +157,19 @@ def normalize_horse_name(text):
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"\s+", "", text)
     text = re.sub(r"^[(（](?:地|外|父|市|招|特)[)）]", "", text)
+    # カタカナ名に紛れ込んだ半角英字 "l"（長音の誤記）を "ー" に補正。
+    # 例: シケlダ → シケーダ（Invincible 等の英馬名中の l はカタカナと隣接しないため影響しない）
+    text = re.sub(r"(?<=[ァ-ヶー])l(?=[ァ-ヶー]|$)", "ー", text)
+    text = text.replace("bーe", "ble")
     return text
+
+def extract_cell_text(node):
+    """縦書きセル内の <br> で区切られた文字を結合して取り出す"""
+    html_str = str(node)
+    html_str = re.sub(r'<br\s*/?>', '', html_str, flags=re.IGNORECASE)
+    temp_soup = BeautifulSoup(html_str, "html.parser")
+    return temp_soup.get_text(separator="", strip=True)
+
 
 def extract_horse_name(cell):
     target_node = None
@@ -174,11 +186,7 @@ def extract_horse_name(cell):
     if not target_node:
         target_node = cell
 
-    html_str = str(target_node)
-    html_str = re.sub(r'<br\s*/?>', '', html_str, flags=re.IGNORECASE)
-    
-    temp_soup = BeautifulSoup(html_str, "html.parser")
-    raw_text = temp_soup.get_text(separator="", strip=True)
+    raw_text = extract_cell_text(target_node)
     
     name = normalize_horse_name(raw_text)
     if "／" in name or "/" in name:
@@ -188,6 +196,32 @@ def extract_horse_name(cell):
             if 2 <= len(part) <= 9:
                 return part
     return name
+
+
+def extract_pedigree(cell):
+    """馬名セルから 馬名, 父馬名, 母馬名, 母父馬名 を抽出する。
+
+    馬名セル内のネスト表は縦書き3列構成で、
+        左列(c232, rowspan=2): 母馬名 ／ 母父馬名
+        中列(c231, rowspan=2): 馬名
+        右列(c232)           : 父馬名
+    となっている。各列は <br> で1文字ずつ分かれているため結合してから正規化する。
+    （全角アルファベットは normalize_horse_name 内の NFKC で半角に統一される）
+    """
+    sire, dam, damsire = "", "", ""
+    nested_table = cell.find("table")
+    if nested_table:
+        first_tr = nested_table.find("tr")
+        if first_tr:
+            tds = first_tr.find_all("td")
+            if len(tds) >= 3:
+                dam_text = normalize_horse_name(extract_cell_text(tds[0]))
+                parts = re.split(r'[／/]', dam_text)
+                dam = parts[0].strip() if parts else ""
+                damsire = parts[1].strip() if len(parts) >= 2 else ""
+                sire = normalize_horse_name(extract_cell_text(tds[2]))
+    name = extract_horse_name(cell)
+    return name, sire, dam, damsire
 
 
 # ============================================================
@@ -279,7 +313,11 @@ def parse_race_html(html_content, url_code):
         row_title = normalize_label(cells[-1]) if len(cells) > num_horses else ""
 
         if row_title == "馬名":
-            data_dict["馬名"] = [extract_horse_name(cell) for cell in html_cells[:num_horses]]
+            pedigrees = [extract_pedigree(cell) for cell in html_cells[:num_horses]]
+            data_dict["馬名"] = [p[0] for p in pedigrees]
+            data_dict["父馬"] = [p[1] for p in pedigrees]
+            data_dict["母馬"] = [p[2] for p in pedigrees]
+            data_dict["母父馬"] = [p[3] for p in pedigrees]
             continue
 
         # --- 当レースの解析 (最新結果) ---
@@ -470,6 +508,7 @@ def main():
         "前走の日付", "前走の天候", "前走の騎手", 
         "前走の頭数", "前走の人気", "前走のタイム差",
         "前走からの日数",
+        "父馬", "母馬", "母父馬",
     ]
 
     base_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()

@@ -77,7 +77,7 @@ MODEL_DIR = os.path.join(BASE_DIR, "models")
 MODEL_FILE = "model_rank.json"           # ランキングモデル
 META_FILE = "meta.json"                  # 特徴列・カテゴリマップ・温度・学習情報
 TUNED_PARAMS_FILE = "tuned_params.json"  # Optuna で探索した最適パラメータ
-META_VERSION = 6                         # v6: ランキング学習 + PL 確率化 + 通算スナップショット診断
+META_VERSION = 7                         # v7: 血統カテゴリ特徴（父馬・母父馬）を追加
 
 # 競馬場番号 → 競馬場名（JRA標準割当）
 PLACE_NAMES = {
@@ -349,6 +349,13 @@ def build_features(df):
 
     if "回り" in df.columns:
         feat["回り" + CAT_SUFFIX] = df["回り"].map(norm_str)
+
+    # 血統情報（父馬・母父馬）をカテゴリ特徴として利用
+    # ※ 母馬は産駒数が少なく過学習になりやすいため使用しない
+    if "父馬" in df.columns:
+        feat["父馬" + CAT_SUFFIX] = df["父馬"].map(norm_str)
+    if "母父馬" in df.columns:
+        feat["母父馬" + CAT_SUFFIX] = df["母父馬"].map(norm_str)
 
     feat["馬体重"] = df["馬体重"].apply(parse_num) if "馬体重" in df.columns else np.nan
     feat["体重増減"] = df["体重増減"].apply(parse_num) if "体重増減" in df.columns else np.nan
