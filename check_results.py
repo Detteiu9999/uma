@@ -82,7 +82,11 @@ def load_results(kekka_dir):
 # ============================================================
 
 def parse_combo(bet_type, combo):
-    """買い目文字列を馬番(枠番)のタプルに変換する。"""
+    if not isinstance(combo, str):
+        return None
+    combo = combo.strip()
+    if combo.startswith('="') and combo.endswith('"'):
+        combo = combo[2:-1].replace('""', '"').strip()
     if bet_type in ("単勝", "複勝"):
         m = re.match(r"^(\d+)", combo)
         return (int(m.group(1)),) if m else None
@@ -159,10 +163,14 @@ def main():
                         help="1点あたりの購入金額（デフォルト 100円）")
     parser.add_argument("--detail", action="store_true",
                         help="的中した買い目の内訳をすべて表示する")
+    parser.add_argument("--race", type=int, help="レース番号で絞り込み")
+    parser.add_argument("--place", help="競馬場名で絞り込み")
+    parser.add_argument("--suggestions", help="照合する買い目CSVのパス")
     args = parser.parse_args()
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    suggestions_path = os.path.join(base_dir, "suggestions", "suggested_bets.csv")
+    suggestions_path = args.suggestions or os.path.join(
+        base_dir, "suggestions", "suggested_bets.csv")
     kekka_dir = os.path.join(base_dir, "CSV_kekka")
 
     if not os.path.exists(suggestions_path):
@@ -175,6 +183,13 @@ def main():
 
     df = pd.read_csv(suggestions_path, encoding="utf-8-sig")
     target = df[(df["的中確率(推定)"] >= args.min_prob) & (df["期待値"] >= args.min_ev)]
+    if args.place:
+        target = target[target["競馬場"] == args.place]
+    if args.race is not None:
+        race_numbers = pd.to_numeric(
+            target["レース番号"].astype(str).str.strip().str.removesuffix("R"),
+            errors="coerce")
+        target = target[race_numbers == args.race]
     print(f"=== 購入シミュレーション ===")
     print(f"条件: 的中確率(推定) >= {args.min_prob} かつ 期待値 >= {args.min_ev} / 1点 {args.stake} 円")
     print(f"対象買い目: {len(target)} 点（全 {len(df)} 点中）")

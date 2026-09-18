@@ -12,9 +12,9 @@ from datetime import date
 # ============================================================
 
 TARGET_YEARS = [26]
-PLACES = range(1,11)
-KAIS = range(1, 13)
-DAYS = range(1, 9)
+PLACES = [6,9]
+KAIS = [4]
+DAYS = [5]
 RACES = range(1, 13)
 
 BASE_URL = "https://jiro8.sakura.ne.jp/index.php?code="
@@ -96,7 +96,7 @@ def calc_days_between(current_date, past_md):
 def split_date_place_weather(value):
     """ "08/02中曇" などを 日付, 競馬場, 天候 に分割 """
     text = str(value).strip()
-    match = re.search(r'^(\d{1,2}/\d{1,2})([^\d晴曇雨小雪]+)?(晴|曇|雨|小|雪)?$', text)
+    match = re.search(r'^(\d{1,2}/\d{1,2})([^\d晴曇雨雪]+?)?(小雨|小雪|晴|曇|雨|小|雪)?$', text)
     if match:
         d = match.group(1) or ""
         p = match.group(2) or ""
@@ -142,7 +142,7 @@ def split_top_margin(value):
 def split_weight_change_3f(value):
     """ "554(+4)1" などを 馬体重, 増減, 上がり3F順位 に分割 """
     text = str(value).strip()
-    match = re.search(r'^([^\(]+?)(?:\((.*?)\))?(\d*)$', text)
+    match = re.search(r'^([^\(]+)(?:\((.*?)\))?(\d*)$', text)
     if match:
         w = match.group(1).strip()
         c = match.group(2) or ""

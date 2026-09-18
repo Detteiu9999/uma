@@ -650,6 +650,94 @@ def update_predict_csv(path, tanpuku, fetched_at):
     return True
 
 
+def normalize_race_id(value) -> str:
+    race_id = str(value).strip()
+    if not re.fullmatch(r"(?:[0-9]{10}|[0-9]{12})", race_id):
+        raise ValueError(f"不正なrace_idです: {value!r}")
+    if len(race_id) == 10:
+        race_id = "20" + race_id
+    place, kai, day, race_num = (int(race_id[i:i + 2]) for i in (4, 6, 8, 10))
+    if not (1 <= place <= 10 and kai > 0 and day > 0 and 1 <= race_num <= 12):
+        raise ValueError(f"不正なrace_idです: {value!r}")
+    return race_id
+
+
+def fetch_live_race_odds(race_id, date_str, base_dir=None) -> dict:
+    race_id = normalize_race_id(race_id)
+    if not isinstance(date_str, str) or not re.fullmatch(r"[0-9]{8}", date_str):
+        raise ValueError("date_strはYYYYMMDDで指定してください")
+    date_obj = datetime.strptime(date_str, "%Y%m%d")
+    year = int(race_id[:4])
+    if date_obj.year != year:
+        raise ValueError("race_idとdate_strの年が一致しません")
+    place, kai, day, race_num = (int(race_id[i:i + 2]) for i in (4, 6, 8, 10))
+    target = {"year": year, "place": place, "kai": kai, "day": day, "date": date_str}
+    bet_codes = {code: key for code, key in PAST_BET_TYPES
+                 if key in ("tanpuku", "umaren", "wide", "umatan", "fuku3")}
+    base_dir = os.path.dirname(os.path.abspath(__file__)) if base_dir is None else os.fspath(base_dir)
+    client = JraOddsClient()
+    try:
+        soup = client.fetch(TOP_PAGE_CNAME)
+        kaisai_cname = None
+        for a in soup.find_all("a", onclick=True):
+            cname = extract_cname(a.get("onclick"))
+            info = parse_cname_body(cname) if cname else None
+            if (info and info["race"] is None
+                    and all(info[field] == value for field, value in target.items())):
+                kaisai_cname = cname
+                break
+        if kaisai_cname is None:
+            raise RuntimeError(f"対象の開催が見つかりません: {race_id} ({date_str})")
+
+        target["race"] = race_num
+        bet_cnames = {}
+
+        def collect_bet_cnames(page):
+            for a in page.find_all("a", onclick=True):
+                cname = extract_cname(a.get("onclick"))
+                info = parse_cname_body(cname) if cname else None
+                if (info and info["bet_code"] in bet_codes
+                        and all(info[field] == value for field, value in target.items())):
+                    bet_cnames.setdefault(bet_codes[info["bet_code"]], cname)
+
+        collect_bet_cnames(client.fetch(kaisai_cname))
+        if "tanpuku" not in bet_cnames:
+            raise RuntimeError(f"単勝複勝のリンクが見つかりません: {race_id}")
+        tanpuku_soup = client.fetch(bet_cnames["tanpuku"])
+        collect_bet_cnames(tanpuku_soup)
+        missing = set(bet_codes.values()) - bet_cnames.keys()
+        if missing:
+            raise RuntimeError(f"オッズリンクが不足しています: {race_id}: {', '.join(sorted(missing))}")
+
+        tanpuku = parse_tanpuku(tanpuku_soup)
+        pairs = {}
+        for name, key in (("馬連", "umaren"), ("ワイド", "wide"), ("馬単", "umatan")):
+            pairs[name] = parse_pair_tables(client.fetch(bet_cnames[key]), key)
+        fuku3 = parse_fuku3(client.fetch(bet_cnames["fuku3"]))
+        dfs = build_odds_dataframes(race_num, tanpuku, pairs, fuku3, [])
+        missing = [key for key in bet_codes.values() if key not in dfs or dfs[key].empty]
+        if missing:
+            raise RuntimeError(f"オッズが空または不足しています: {race_id}: {', '.join(missing)}")
+
+        odds_dir = os.path.join(base_dir, "odds")
+        os.makedirs(odds_dir, exist_ok=True)
+        place_name = PLACE_NAMES[place]
+        fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_odds_csvs(dfs, odds_dir, date_str, place_name, kai, day, race_num)
+        race_keys = {(f"{year}年 第{kai}回{day}日目", place_name, f"{race_num}R")}
+        update_prediction_csvs(os.path.join(base_dir, "predictions"), race_keys, tanpuku, fetched_at)
+        predict_ids = [race_id]
+        if race_id.startswith("20"):
+            predict_ids.append(race_id[2:])
+        for predict_id in predict_ids:
+            path = os.path.join(base_dir, "CSV_predict", f"horse_racing_data_{predict_id}.csv")
+            if os.path.isfile(path):
+                update_predict_csv(path, tanpuku, fetched_at)
+        return dfs
+    finally:
+        client.session.close()
+
+
 def main_from_predict(args):
     """CSV_predict/ 内の全レースについて、過去のレース結果ページから最終オッズを取得する。"""
     base_dir = os.path.dirname(os.path.abspath(__file__))

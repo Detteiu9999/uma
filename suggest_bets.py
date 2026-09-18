@@ -11,26 +11,29 @@ predictions/ の予測確率（1着/2着以内/3着以内）と odds/ の最新�
     ・3着以内確率 < 0.1 → その馬が「3着以内指定」される買い目（複勝・ワイド・3連複・3連単の3着）を除外
   例: 2着以内/3着以内が 0.1 未満でも 1着確率が 0.2 なら単勝は候補に残る。
 
-確率の近似:
+確率の計算:
   ・単勝/複勝         : その馬の 1着確率 / 3着以内確率
-  ・枠連              : 枠内の馬の 2着以内確率の合計（枠内2頭以上は順不同のため）
-  ・馬連/ワイド       : P(aが2着以内)×P(bが2着以内) ※ワイドは3着以内確率を使用
-  ・馬単 a→b          : P(aが1着)×P(bが2着以内)
-  ・3連複             : 3頭の 3着以内確率の積
-  ・3連単 a→b→c       : P(aが1着)×P(bが2着以内)×P(cが3着以内)
-  ※いずれも独立性に基づく近似値です。
+  ・枠連/馬連/馬単/3連複/3連単/ワイド:
+      各馬の 1着確率を強さとした Plackett–Luce モデルによる推定。
+      枠連は全出走馬の馬単確率を、対象の枠組合せについて合算する。
+      実際の的中確率や独立性近似に対する優位性を保証するものではない。
+    ※--indep を付けると従来の独立性近似（単純な掛け算）に戻せます。
 
 使い方:
     python suggest_bets.py                          # 全レースを処理してCSV出力
-    python suggest_bets.py --race-key 20260906_札幌2回6日 --race 11
+    python suggest_bets.py --place 札幌 --race 11
     python suggest_bets.py --min-ev 1.2             # 期待値1.2以上のものを出力
 """
 
 import argparse
 import glob
+import math
 import os
 import re
+from itertools import permutations
+from numbers import Integral
 
+import numpy as np
 import pandas as pd
 
 # ============================================================
@@ -39,6 +42,14 @@ import pandas as pd
 
 PROB_THRESHOLD = 0.1     # この確率を下回る馬は関連買い目から除外
 DEFAULT_MIN_EV = 1.0     # 期待値の下限（これ以上を提案）
+
+DISCORD_BET_RULES = {
+    "馬連": (0.15, 1.0, math.inf),
+    "馬単": (0.1, 1.0, 1.5),
+    "3連複": (0.125, 1.5, 3.0),
+    "ワイド": (0.3, 1.2, math.inf),
+    "複勝": (0.5, 1.2, math.inf),
+}
 
 # 競馬場コード → 場名
 PLACE_NAMES = {
@@ -122,6 +133,96 @@ class Horse:
         return self.p3 >= PROB_THRESHOLD
 
 
+def _validate_probabilities(p, normalized=True):
+    try:
+        p = np.asarray(p, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Probabilities must be a finite numeric vector") from exc
+    if (p.ndim != 1 or not len(p) or not np.all(np.isfinite(p))
+            or np.any(p < 0) or np.any(p > 1)):
+        raise ValueError("Probabilities must be a nonempty vector in [0, 1]")
+    total = math.fsum(p)
+    if total <= 0:
+        raise ValueError("Probabilities must have positive total mass")
+    if normalized and not math.isclose(total, 1.0, rel_tol=1e-9, abs_tol=1e-12):
+        raise ValueError("Harville probabilities must sum to one")
+    return p
+
+
+def _validate_indices(p, indices):
+    if any(not isinstance(i, Integral) or isinstance(i, (bool, np.bool_))
+           or i < 0 or i >= len(p) for i in indices):
+        raise ValueError("Horse indices must be integers within the field")
+    if len(set(indices)) != len(indices):
+        raise ValueError("Horse indices must be distinct")
+
+
+def _ordered_probability(p, indices):
+    remaining = list(range(len(p)))
+    prob = 1.0
+    for i in indices:
+        denominator = math.fsum(p[j] for j in remaining)
+        if denominator == 0 or p[i] == 0:
+            return 0.0
+        prob *= p[i] / denominator
+        remaining.remove(i)
+    return prob
+
+
+def harville_exacta(p, a, b):
+    p = _validate_probabilities(p)
+    _validate_indices(p, (a, b))
+    return _ordered_probability(p, (a, b))
+
+
+def harville_quinella(p, a, b):
+    p = _validate_probabilities(p)
+    _validate_indices(p, (a, b))
+    return math.fsum(_ordered_probability(p, order)
+                     for order in permutations((a, b)))
+
+
+def harville_trifecta(p, a, b, c):
+    p = _validate_probabilities(p)
+    _validate_indices(p, (a, b, c))
+    return _ordered_probability(p, (a, b, c))
+
+
+def harville_trio(p, a, b, c):
+    p = _validate_probabilities(p)
+    _validate_indices(p, (a, b, c))
+    return math.fsum(_ordered_probability(p, order)
+                     for order in permutations((a, b, c)))
+
+
+def harville_wide(p, a, b):
+    p = _validate_probabilities(p)
+    _validate_indices(p, (a, b))
+    if len(p) == 2:
+        return harville_quinella(p, a, b)
+    return min(1.0, math.fsum(
+        _ordered_probability(p, order)
+        for x in range(len(p)) if x not in (a, b)
+        for order in permutations((a, b, x))))
+
+
+def harville_wakuren(p, frames, w1, w2):
+    p = _validate_probabilities(p)
+    if len(frames) != len(p):
+        raise ValueError("Each horse must have a frame entry")
+    return math.fsum(
+        _ordered_probability(p, (a, b))
+        for a in range(len(p)) for b in range(len(p))
+        if a != b and ((frames[a] == w1 and frames[b] == w2)
+                       or (frames[a] == w2 and frames[b] == w1)))
+
+
+def win_probs_vector(horses):
+    p = _validate_probabilities([h.p1 for h in horses], normalized=False)
+    p = p / max(p)
+    return p / math.fsum(p)
+
+
 def parse_wide_odds(text):
     """'27.8-29.9' -> (27.8, 29.9)。パースできなければ (None, None)"""
     m = re.match(r"^\s*([\d.]+)\s*-\s*([\d.]+)\s*$", str(text))
@@ -130,30 +231,35 @@ def parse_wide_odds(text):
     return float(m.group(1)), float(m.group(2))
 
 
-def suggest_for_race(horses, odds_for_race, min_ev):
-    """
-    1レース分の買い目候補を列挙する。
-    horses: [Horse, ...]  odds_for_race: {式別キー: DataFrame}
-    戻り値: [{式別, 買い目, 的中確率(推定), オッズ, 期待値, 備考}, ...]
-    """
+def meets_discord_rules(bet_type, prob, ev):
+    rule = DISCORD_BET_RULES.get(bet_type)
+    return (rule is not None and math.isfinite(prob) and math.isfinite(ev)
+            and rule[0] <= prob <= 1.0 and rule[1] <= ev <= rule[2])
+
+
+def suggest_for_race(horses, odds_for_race, min_ev, use_harville=True,
+                     discord_only=False):
     by_num = {h.num: h for h in horses}
+    if len(by_num) != len(horses):
+        raise ValueError("Horse numbers must be distinct")
+    idx_of = {h.num: i for i, h in enumerate(horses)}
+    pwin = win_probs_vector(horses)
     suggestions = []
 
     def add(bet_type, combo, prob, odds_val, note=""):
-        if prob is None or odds_val is None:
-            return
-
-        # 確率0.1未満の買い目は提案しない
-        if prob < PROB_THRESHOLD:
-            return
-
         try:
+            prob = float(prob)
             odds_f = float(odds_val)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            return
+        if (not math.isfinite(prob) or not math.isfinite(odds_f)
+                or not PROB_THRESHOLD <= prob <= 1.0 or odds_f <= 0):
             return
 
         ev = prob * odds_f
-        if ev >= min_ev:
+        if discord_only and not meets_discord_rules(bet_type, prob, ev):
+            return
+        if math.isfinite(ev) and ev >= min_ev:
             suggestions.append({
                 "式別": bet_type, "買い目": combo,
                 "的中確率(推定)": round(prob, 4),
@@ -183,21 +289,23 @@ def suggest_for_race(horses, odds_for_race, min_ev):
     # --- 枠連 ---
     df = odds_for_race.get("wakuren")
     if df is not None:
-        # 枠ごとの「2着以内確率の合計」（枠内の馬は ok_place2 のものだけ数える）
-        waku_prob = {}
+        frames = [h.waku for h in horses]
+        waku_p2 = {}
         for h in horses:
-            if h.waku is None or not h.ok_place2:
-                continue
-            waku_prob[h.waku] = waku_prob.get(h.waku, 0.0) + h.p2
+            if h.waku is not None and h.ok_place2:
+                waku_p2[h.waku] = waku_p2.get(h.waku, 0.0) + h.p2
         for _, row in df.iterrows():
             try:
                 w1, w2 = int(row["枠番1"]), int(row["枠番2"])
             except (TypeError, ValueError):
                 continue
-            # 両方の枠に対象馬がいる場合のみ
-            if w1 in waku_prob and w2 in waku_prob:
-                add("枠連", f"枠{w1}-枠{w2}", waku_prob[w1] * waku_prob[w2],
-                    row.get("枠連オッズ"))
+            if use_harville:
+                prob = harville_wakuren(pwin, frames, w1, w2)
+                add("枠連", f"枠{w1}-枠{w2}", prob, row.get("枠連オッズ"))
+            else:
+                if w1 in waku_p2 and w2 in waku_p2:
+                    add("枠連", f"枠{w1}-枠{w2}", waku_p2[w1] * waku_p2[w2],
+                        row.get("枠連オッズ"))
 
     # --- 馬連・ワイド ---
     for bet_key, bet_name, prob_attr, ok_attr in [
@@ -213,11 +321,16 @@ def suggest_for_race(horses, odds_for_race, min_ev):
             except (TypeError, ValueError):
                 continue
             ha, hb = by_num.get(a), by_num.get(b)
-            if not ha or not hb:
+            if not ha or not hb or a == b:
                 continue
             if not (getattr(ha, ok_attr) and getattr(hb, ok_attr)):
                 continue
-            prob = getattr(ha, prob_attr) * getattr(hb, prob_attr)
+            if use_harville:
+                ia, ib = idx_of[a], idx_of[b]
+                prob = (harville_quinella(pwin, ia, ib) if bet_key == "umaren"
+                        else harville_wide(pwin, ia, ib))
+            else:
+                prob = getattr(ha, prob_attr) * getattr(hb, prob_attr)
             if bet_key == "wide":
                 lo, hi = parse_wide_odds(row.get("ワイドオッズ"))
                 add(bet_name, f"{a}-{b}", prob, lo, note="ワイドオッズは下限値で評価")
@@ -233,12 +346,16 @@ def suggest_for_race(horses, odds_for_race, min_ev):
             except (TypeError, ValueError):
                 continue
             ha, hb = by_num.get(a), by_num.get(b)
-            if not ha or not hb:
+            if not ha or not hb or a == b:
                 continue
             # 1着指定の馬は ok_win、2着指定の馬は ok_place2 が必要
             if not (ha.ok_win and hb.ok_place2):
                 continue
-            add("馬単", f"{a}→{b}", ha.p1 * hb.p2, row.get("馬単オッズ"))
+            if use_harville:
+                prob = harville_exacta(pwin, idx_of[a], idx_of[b])
+            else:
+                prob = ha.p1 * hb.p2
+            add("馬単", f"{a}→{b}", prob, row.get("馬単オッズ"))
 
     # --- 3連複 ---
     df = odds_for_race.get("fuku3")
@@ -249,11 +366,14 @@ def suggest_for_race(horses, odds_for_race, min_ev):
             except (TypeError, ValueError):
                 continue
             hs = [by_num.get(x) for x in (a, b, c)]
-            if any(h is None for h in hs):
+            if len({a, b, c}) != 3 or any(h is None for h in hs):
                 continue
             if not all(h.ok_place3 for h in hs):
                 continue
-            prob = hs[0].p3 * hs[1].p3 * hs[2].p3
+            if use_harville:
+                prob = harville_trio(pwin, idx_of[a], idx_of[b], idx_of[c])
+            else:
+                prob = hs[0].p3 * hs[1].p3 * hs[2].p3
             add("3連複", f"{a}-{b}-{c}", prob, row.get("3連複オッズ"))
 
     # --- 3連単 ---
@@ -265,11 +385,15 @@ def suggest_for_race(horses, odds_for_race, min_ev):
             except (TypeError, ValueError):
                 continue
             ha, hb, hc = by_num.get(a), by_num.get(b), by_num.get(c)
-            if not ha or not hb or not hc:
+            if len({a, b, c}) != 3 or not ha or not hb or not hc:
                 continue
             if not (ha.ok_win and hb.ok_place2 and hc.ok_place3):
                 continue
-            add("3連単", f"{a}→{b}→{c}", ha.p1 * hb.p2 * hc.p3, row.get("3連単オッズ"))
+            if use_harville:
+                prob = harville_trifecta(pwin, idx_of[a], idx_of[b], idx_of[c])
+            else:
+                prob = ha.p1 * hb.p2 * hc.p3
+            add("3連単", f"{a}→{b}→{c}", prob, row.get("3連単オッズ"))
 
     return suggestions
 
@@ -287,6 +411,9 @@ def main():
     parser.add_argument("--place-code", type=int,
                         help="競馬場コードで絞り込み（1=札幌 … 10=小倉）")
     parser.add_argument("--race", type=int, help="レース番号で絞り込み")
+    parser.add_argument("--indep", action="store_true",
+                        help="組合せ確率を従来の独立性近似（掛け算）で計算する")
+    parser.add_argument("--output", help="出力CSVのパス")
     args = parser.parse_args()
 
     place_filter = args.place
@@ -335,7 +462,8 @@ def main():
             odds_for_race = {bet: df for (rk, rn, bet), df in odds.items()
                              if rk == race_key and rn == race_num}
             horses = [Horse(row) for _, row in df_pred.iterrows()]
-            suggestions = suggest_for_race(horses, odds_for_race, args.min_ev)
+            suggestions = suggest_for_race(horses, odds_for_race, args.min_ev,
+                                           use_harville=not args.indep)
             if not suggestions:
                 continue
 
@@ -352,18 +480,15 @@ def main():
         print("（--min-ev を下げるか、対象レースの予測CSV/オッズCSVがあるか確認してください）")
         return
 
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "suggested_bets.csv")
-    
-    # --- ここから修正部分（Excelの日付変換対策） ---
+    out_path = args.output or os.path.join(out_dir, "suggested_bets.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+
     df_out = pd.DataFrame(all_rows)
     if "買い目" in df_out.columns:
-        # 買い目列のすべての値を ="1-2" のようなExcelの数式形式に変換する
         df_out["買い目"] = df_out["買い目"].apply(lambda x: f'="{x}"')
-    
+
     df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
-    # --- 修正ここまで ---
-    
+
     print(f"全候補を保存しました: {out_path} ({len(all_rows)}件)")
 
 

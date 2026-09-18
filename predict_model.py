@@ -74,10 +74,12 @@ PRED_DIR = os.path.join(BASE_DIR, "CSV_predict")
 OUT_DIR = os.path.join(BASE_DIR, "predictions")
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 
-MODEL_FILE = "model_rank.json"           # ランキングモデル
+MODEL_FILE = "model_rank.json"           # ランキングモデル (XGBoost)
+LGB_MODEL_FILE = "model_rank_lgb.txt"    # ランキングモデル (LightGBM, アンサンブル用)
+MT_MODEL_FILE = "model_mt_win.json"
 META_FILE = "meta.json"                  # 特徴列・カテゴリマップ・温度・学習情報
 TUNED_PARAMS_FILE = "tuned_params.json"  # Optuna で探索した最適パラメータ
-META_VERSION = 7                         # v7: 血統カテゴリ特徴（父馬・母父馬）を追加
+META_VERSION = 8
 
 # 競馬場番号 → 競馬場名（JRA標準割当）
 PLACE_NAMES = {
@@ -126,7 +128,8 @@ CAREER_SNAPSHOT = "post"
 DROP_CAREER = False
 # 除外対象の特徴名パターン
 CAREER_FEATURE_PATTERN = re.compile(
-    r"^通算|^脚質_(逃|先|差|追|先行率|平均位置)|クラス変化|^レース内_(逃げ|先行)馬数")
+    r"^通算|^脚質_|クラス変化|^レース内_(逃げ|先行|差し|追込)馬数|"
+    r"^レース_(逃げ先行率|ハイペース指標)|^展開_|^騎手_同脚質_")
 
 
 # ============================================================
@@ -332,6 +335,20 @@ def group_top_and_second(v, grp_key):
 # ============================================================
 # 特徴量エンジニアリング
 # ============================================================
+USE_PACE_FEATURES = False
+
+# 展開特徴の列名（一括削除用）
+PACE_FEATURE_NAMES = [
+    "レース内_差し馬数", "レース内_追込馬数",
+    "レース_逃げ先行率", "レース_ハイペース指標",
+    "展開_有利度", "展開_単騎逃げ", "展開_前の競馬数", "展開_先行率_レース内偏差",
+]
+
+
+def drop_pace_features(feat):
+    return feat[[c for c in feat.columns if c not in PACE_FEATURE_NAMES]]
+
+
 def build_features(df):
     feat = pd.DataFrame(index=df.index)
 
@@ -371,10 +388,6 @@ def build_features(df):
     baba_map = {"良": 1.0, "稍": 2.0, "稍重": 2.0, "重": 3.0, "不": 4.0, "不良": 4.0}
     if "馬場" in df.columns:
         feat["馬場_数値"] = df["馬場"].map(lambda x: baba_map.get(norm_str(x), np.nan))
-
-    # ※ 今回レースの「脚質」列が結果由来（通過順位から算出）の場合はリークになるため要確認
-    if "脚質" in df.columns:
-        feat["脚質_数値"] = df["脚質"].apply(parse_style_numeric)
 
     finish_now = df["着順"].apply(parse_finish) if "着順" in df.columns else None
     subtract_current = (finish_now is not None) and (CAREER_SNAPSHOT == "post")
@@ -524,7 +537,12 @@ def build_features(df):
     feat["着順_トレンド"] = feat["前走_着順"] - feat["2走前_着順"]
 
     if "前走_クラス" in feat.columns and career_wins_adj is not None:
-        cur_class = infer_current_class_from_wins(career_wins_adj)
+        if "URLコード" in df.columns:
+            wins = pd.Series(career_wins_adj, index=df.index)
+            cur_class = wins.groupby(df["URLコード"].astype(str)).transform(
+                infer_current_class_from_wins)
+        else:
+            cur_class = infer_current_class_from_wins(career_wins_adj)
         if cur_class is not None:
             feat["クラス変化"] = cur_class - feat["前走_クラス"]
 
@@ -565,8 +583,36 @@ def build_features(df):
         dom = np.where(has_style, style_arr.argmax(axis=1), -1)
         is_nige = pd.Series((dom == 0).astype(float), index=df.index)
         is_senko = pd.Series((dom == 1).astype(float), index=df.index)
-        feat["レース内_逃げ馬数"] = is_nige.groupby(race_grp).transform("sum") - is_nige
-        feat["レース内_先行馬数"] = is_senko.groupby(race_grp).transform("sum") - is_senko
+        is_sashi = pd.Series((dom == 2).astype(float), index=df.index)
+        is_oikomi = pd.Series((dom == 3).astype(float), index=df.index)
+        n_nige_others = is_nige.groupby(race_grp).transform("sum") - is_nige
+        n_senko_others = is_senko.groupby(race_grp).transform("sum") - is_senko
+        n_sashi_others = is_sashi.groupby(race_grp).transform("sum") - is_sashi
+        n_oikomi_others = is_oikomi.groupby(race_grp).transform("sum") - is_oikomi
+        feat["レース内_逃げ馬数"] = n_nige_others
+        feat["レース内_先行馬数"] = n_senko_others
+        feat["レース内_差し馬数"] = n_sashi_others
+        feat["レース内_追込馬数"] = n_oikomi_others
+
+        # --- 展開（ペース）予測の精緻化 ---
+        # 逃げ・先行馬が多いほどハイペースになりやすい → 前残りが不利/差し追込が有利
+        nige_total = n_nige_others + is_nige          # レース内の逃げ馬総数
+        senko_total = n_senko_others + is_senko
+        heads = feat["レース頭数"].replace(0, np.nan)
+        feat["レース_逃げ先行率"] = (nige_total + senko_total) / heads
+        feat["レース_ハイペース指標"] = (nige_total * 2 + senko_total) / heads
+        # 自身の脚質とペースの相性:
+        #   ハイペース × 差し/追込 → 有利 (+), ハイペース × 逃げ/先行 → 不利 (-)
+        feat["展開_有利度"] = feat["レース_ハイペース指標"] * (
+            is_sashi + is_oikomi - is_nige - is_senko)
+        # 逃げ馬がいないレースでは逃げ馬が圧倒的に有利（単騎逃げ）
+        feat["展開_単騎逃げ"] = ((n_nige_others == 0) & (is_nige == 1)).astype(float)
+        # 自分より前に行きたがる馬の数（逃げ + 先行）= 位置取りの混戦度
+        feat["展開_前の競馬数"] = n_nige_others + n_senko_others
+        # 通算先行率のレース内平均との差（このレースで普段より前に行く必要があるか）
+        if "脚質_先行率" in feat.columns:
+            feat["展開_先行率_レース内偏差"] = (
+                feat["脚質_先行率"] - feat.groupby(race_grp)["脚質_先行率"].transform("mean"))
 
     return feat
 
@@ -908,6 +954,52 @@ def evaluate_ranking(scores, finish, groups):
     return float((top["f"] == 1).mean()), float((top["f"] <= 3).mean()), len(top)
 
 
+def blend_group_scores(scores, groups, optional_scores=None, weight=0.0,
+                       win_probabilities=False):
+    scores = np.asarray(scores, dtype=float)
+    groups = np.asarray(groups)
+    if scores.ndim != 1 or groups.shape != scores.shape or pd.isna(groups).any():
+        raise ValueError("Scores and race groups must be matching one-dimensional arrays")
+    if not np.isfinite(scores).all() or not np.isfinite(weight) or not 0 <= weight <= 1:
+        raise ValueError("Scores and blend weight must be finite; weight must be in [0, 1]")
+    if weight == 0:
+        return scores.copy()
+    if optional_scores is None:
+        raise ValueError("An optional model is required for a nonzero blend weight")
+    optional = np.asarray(optional_scores, dtype=float)
+    if optional.shape != scores.shape or not np.isfinite(optional).all():
+        raise ValueError("Optional scores must be finite and match ranking scores")
+    if win_probabilities:
+        if ((optional < 0) | (optional > 1)).any():
+            raise ValueError("Win classifier probabilities must be in [0, 1]")
+        optional = np.clip(optional, 1e-9, 1 - 1e-9)
+        optional = np.log(optional / (1 - optional))
+    mixed = np.empty_like(scores)
+    for positions in pd.Series(np.arange(len(scores))).groupby(groups, sort=False).indices.values():
+        base = scores[positions]
+        other = optional[positions]
+        base = (base - base.mean()) / (base.std(ddof=0) + 1e-9)
+        other = (other - other.mean()) / (other.std(ddof=0) + 1e-9)
+        mixed[positions] = (1 - weight) * base + weight * other
+    return mixed
+
+
+def select_blend(scores, finish, groups, candidates):
+    selected = blend_group_scores(scores, groups)
+    best_hit, _, _ = evaluate_ranking(selected, finish, groups)
+    best_name, best_weight = None, 0.0
+    for name, optional, weights in candidates:
+        for weight in weights:
+            mixed = blend_group_scores(scores, groups, optional, float(weight),
+                                       win_probabilities=name == "win")
+            hit, _, _ = evaluate_ranking(mixed, finish, groups)
+            if hit > best_hit:
+                best_name, best_weight, best_hit = name, float(weight), hit
+                selected = mixed
+    temperature, _ = fit_temperature(selected, finish, groups)
+    return best_name, best_weight, selected, temperature, best_hit
+
+
 def softmax_by_group(scores, groups, temperature):
     s = pd.Series(np.asarray(scores, dtype=float) / temperature)
     g = pd.Series(np.asarray(groups))
@@ -931,35 +1023,35 @@ def fit_temperature(scores, finish, groups):
 def pl_topk_probs(scores, temperature):
     """1レースのスコア → Plackett–Luce による 1着 / 2着以内 / 3着以内 確率（厳密解）"""
     s = np.asarray(scores, dtype=float)
+    if s.ndim != 1 or not np.isfinite(s).all():
+        raise ValueError("Scores must be a finite one-dimensional array")
+    if not np.isfinite(temperature) or temperature <= 0:
+        raise ValueError("Temperature must be finite and positive")
     n = len(s)
-    ones = np.ones(n)
     if n == 0:
-        return s, s, s
-    w = np.exp((s - s.max()) / temperature)
-    S = w.sum()
-    p1 = w / S
-    if n <= 1:
-        return p1, ones, ones
+        return s.copy(), s.copy(), s.copy()
 
-    # P(i が2着以内) = P(i 1着) + Σ_{j≠i} P(j 1着) * w_i / (S - w_j)
-    a = p1 / (S - w)
-    p2 = p1 + w * (a.sum() - a)
+    def probabilities(indices):
+        values = s[indices]
+        weights = np.exp((values - values.max()) / temperature)
+        return weights / weights.sum()
+
+    indices = np.arange(n)
+    p1 = probabilities(indices)
     if n <= 2:
-        return p1, ones, ones
+        return p1, np.ones(n), np.ones(n)
+    p2 = p1.copy()
+    third = np.zeros(n)
+    for first in indices:
+        remaining = indices[indices != first]
+        second_probs = probabilities(remaining)
+        p2[remaining] += p1[first] * second_probs
+        if n > 3 and p1[first] > 0:
+            for second, conditional in zip(remaining, second_probs):
+                last = remaining[remaining != second]
+                third[last] += p1[first] * conditional * probabilities(last)
     p2 = np.clip(p2, 0, 1)
-
-    if n <= 3:
-        return p1, p2, ones
-    # P(i が3着以内) = P2_i + Σ_{j≠i} Σ_{k≠i,j} P(j 1着) P(k 2着|j) * w_i / (S - w_j - w_k)
-    Wj = w[:, None]
-    Wk = w[None, :]
-    denom = (S - Wj) * (S - Wj - Wk)
-    B = (p1[:, None] * Wk) / denom
-    np.fill_diagonal(B, 0.0)
-    total = B.sum()
-    extra = w * (total - B.sum(axis=1) - B.sum(axis=0))
-    p3 = np.clip(p2 + extra, 0, 1)
-    p3 = np.maximum(p3, p2)
+    p3 = np.clip(p2 + third, 0, 1) if n > 3 else np.ones(n)
     return p1, p2, p3
 
 
@@ -991,8 +1083,46 @@ def make_rank_label(finish, groups):
     return (n_heads - finish.astype(float)).clip(lower=0)
 
 
-def train_and_eval(X, finish, groups, cat_cols, param_overrides=None):
-    """時系列検証 → 温度較正 → 全データで最終モデル学習"""
+def train_lgb_rank(X, label, groups, cat_cols, tr, va, seed=RANDOM_SEED):
+    """LightGBM の lambdarank で学習し (model, best_iter, valスコア) を返す"""
+    import lightgbm as lgb
+    params = dict(
+        objective="lambdarank",
+        metric="ndcg",
+        ndcg_eval_at=[3],
+        lambdarank_truncation_level=18,
+        label_gain=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+        learning_rate=0.02,
+        num_leaves=31,
+        max_depth=6,
+        min_data_in_leaf=40,
+        feature_fraction=0.7,
+        bagging_fraction=0.8,
+        bagging_freq=1,
+        lambda_l2=5.0,
+        verbose=-1,
+        seed=seed,
+    )
+    dtr = lgb.Dataset(X.iloc[tr], label=label.iloc[tr],
+                      group=groups.iloc[tr].value_counts().sort_index().values,
+                      categorical_feature=cat_cols if cat_cols else "auto")
+    dva = lgb.Dataset(X.iloc[va], label=label.iloc[va],
+                      group=groups.iloc[va].value_counts().sort_index().values,
+                      reference=dtr)
+    model = lgb.train(params, dtr, num_boost_round=MAX_ROUNDS,
+                      valid_sets=[dva],
+                      callbacks=[lgb.early_stopping(EARLY_STOP, verbose=False)])
+    pred = model.predict(X.iloc[va], num_iteration=model.best_iteration)
+    return model, model.best_iteration, pred
+
+
+def group_sizes(groups):
+    """グループごとの行数（LightGBM の group パラメータ用）"""
+    return groups.value_counts().sort_index().values
+
+
+def train_and_eval(X, finish, groups, cat_cols, param_overrides=None,
+                   use_lgb=False, use_mt=False):
     X = X.reset_index(drop=True)
     finish = finish.reset_index(drop=True)
     groups = groups.reset_index(drop=True)
@@ -1046,7 +1176,65 @@ def train_and_eval(X, finish, groups, cat_cols, param_overrides=None):
     except Exception:
         pass
     report_categorical_importance(final_model, cat_cols)
-    return final_model, temperature, hit1
+
+    candidates = []
+    lgb_iters, mt_iters = [], []
+    lgb_model, mt_model = None, None
+    ens_w, mt_w = 0.0, 0.0
+    if use_lgb:
+        lgb_oof = np.full(len(X), np.nan)
+        for tr, va in folds:
+            _, best_iter, pred = train_lgb_rank(X, label, groups, cat_cols, tr, va)
+            lgb_oof[va] = pred
+            lgb_iters.append(best_iter)
+        candidates.append(("lgb", lgb_oof[mask], np.linspace(0.1, 0.9, 9)))
+    if use_mt:
+        mt_params = dict(objective="binary:logistic", eval_metric="logloss",
+                         tree_method="hist", device=DEVICE,
+                         learning_rate=0.05, max_depth=5, min_child_weight=30,
+                         subsample=0.8, colsample_bytree=0.6,
+                         reg_alpha=1.0, reg_lambda=5.0,
+                         random_state=RANDOM_SEED, verbosity=0)
+        mt_oof = np.full(len(X), np.nan)
+        for tr, va in folds:
+            mtr = xgb.DMatrix(X.iloc[tr], label=(finish.iloc[tr] == 1).astype(int),
+                              enable_categorical=True)
+            mva = xgb.DMatrix(X.iloc[va], label=(finish.iloc[va] == 1).astype(int),
+                              enable_categorical=True)
+            m1 = xgb.train(mt_params, mtr, num_boost_round=3000,
+                           evals=[(mva, "valid")], early_stopping_rounds=100,
+                           verbose_eval=False)
+            mt_oof[va] = m1.predict(mva, iteration_range=(0, m1.best_iteration + 1))
+            mt_iters.append(m1.best_iteration + 1)
+        candidates.append(("win", mt_oof[mask], np.linspace(0.05, 0.5, 10)))
+
+    selected, weight, mixed, temperature, hit1 = select_blend(
+        oof[mask], finish[mask].values, groups[mask].values, candidates)
+    p_win = softmax_by_group(mixed, groups[mask].values, temperature)
+    win_ll = -np.mean(np.log(np.clip(p_win[finish[mask].values == 1], 1e-9, 1)))
+    print(f"  [最終選択] {selected or 'XGBoost'} 重み={weight:.2f} "
+          f"1着的中率={hit1:.4f} 温度={temperature:.3f} LogLoss={win_ll:.4f}")
+    if selected == "lgb":
+        import lightgbm as lgb
+        ens_w = weight
+        dall_l = lgb.Dataset(X, label=label, group=group_sizes(groups),
+                             categorical_feature=cat_cols if cat_cols else "auto")
+        lgb_model = lgb.train(
+            dict(objective="lambdarank", metric="ndcg", ndcg_eval_at=[3],
+                 lambdarank_truncation_level=18, label_gain=list(range(18)),
+                 learning_rate=0.02, num_leaves=31, max_depth=6,
+                 min_data_in_leaf=40, feature_fraction=0.7,
+                 bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0,
+                 verbose=-1, seed=RANDOM_SEED),
+            dall_l, num_boost_round=max(int(np.mean(lgb_iters) * 1.1), 50))
+    elif selected == "win":
+        mt_w = weight
+        dall_m = xgb.DMatrix(X, label=(finish == 1).astype(int), enable_categorical=True)
+        mt_model = xgb.train(mt_params, dall_m,
+                             num_boost_round=max(int(np.mean(mt_iters) * 1.1), 50),
+                             verbose_eval=False)
+
+    return final_model, temperature, hit1, lgb_model, ens_w, mt_model, mt_w
 
 
 # ============================================================
@@ -1088,8 +1276,12 @@ def prepare_training_matrix(train_df):
     X_full = build_features(train_df)
     if DROP_CAREER:
         X_full = drop_career_features(X_full)
+    if not USE_PACE_FEATURES:
+        X_full = drop_pace_features(X_full)
     print("騎手・調教師の Target Encoding（OOF）を計算中 ...")
     X_full = add_personnel_features_oof(X_full, train_df, groups)
+    if DROP_CAREER:
+        X_full = drop_career_features(X_full)
     personnel_stats = calc_personnel_stats(train_df)
     cat_maps = fit_category_maps(X_full)
     X_enc, cat_cols = apply_category_maps(X_full, cat_maps)
@@ -1186,9 +1378,27 @@ def run_tuning(n_trials=50):
 # ============================================================
 # モデルの保存・読込
 # ============================================================
-def save_models(model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature):
+def validate_blend_models(lgb_model, ensemble_weight, mt_model, mt_weight):
+    for model, weight in ((lgb_model, ensemble_weight), (mt_model, mt_weight)):
+        if not np.isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError("Blend weights must be finite and in [0, 1]")
+        if bool(model is not None) != bool(weight > 0):
+            raise ValueError("Optional model and nonzero blend weight must both be present")
+    if ensemble_weight > 0 and mt_weight > 0:
+        raise ValueError("Only one optional blend model may be selected; retrain")
+
+
+def save_models(model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature,
+                lgb_model=None, ensemble_weight=0.0, mt_model=None, mt_weight=0.0):
+    validate_blend_models(lgb_model, ensemble_weight, mt_model, mt_weight)
+    if not np.isfinite(temperature) or temperature <= 0:
+        raise ValueError("Temperature must be finite and positive")
     os.makedirs(MODEL_DIR, exist_ok=True)
     model.save_model(os.path.join(MODEL_DIR, MODEL_FILE))
+    if lgb_model is not None:
+        lgb_model.save_model(os.path.join(MODEL_DIR, LGB_MODEL_FILE))
+    if mt_model is not None:
+        mt_model.save_model(os.path.join(MODEL_DIR, MT_MODEL_FILE))
     meta = {
         "feature_cols": feature_cols,
         "cat_cols": cat_cols,
@@ -1197,8 +1407,13 @@ def save_models(model, cat_maps, feature_cols, cat_cols, personnel_stats, temper
         "temperature": temperature,
         "career_snapshot": CAREER_SNAPSHOT,
         "drop_career": DROP_CAREER,
+        "use_pace_features": USE_PACE_FEATURES,
         "career_band_ranges": {k: list(v) for k, v in CAREER_BAND_RANGES.items()},
         "params": xgb_params(),
+        "has_lgb": lgb_model is not None,
+        "ensemble_weight": ensemble_weight,
+        "has_mt": mt_model is not None,
+        "mt_weight": mt_weight,
         "version": META_VERSION,
     }
     with open(os.path.join(MODEL_DIR, META_FILE), "w", encoding="utf-8") as fh:
@@ -1207,16 +1422,30 @@ def save_models(model, cat_maps, feature_cols, cat_cols, personnel_stats, temper
 
 
 def load_models():
-    global CAREER_SNAPSHOT, DROP_CAREER
+    global CAREER_SNAPSHOT, DROP_CAREER, USE_PACE_FEATURES
     meta_path = os.path.join(MODEL_DIR, META_FILE)
     if not os.path.exists(meta_path):
         raise SystemExit(f"学習済みモデルが見つかりません（{meta_path}）。\n"
                          f"先に学習を実行してください:  python predict_model.py --train")
     with open(meta_path, "r", encoding="utf-8") as fh:
         meta = json.load(fh)
-    if meta.get("version", 1) < META_VERSION:
-        raise SystemExit("保存済みモデルは旧形式です。ランキング学習に仕様が変わったため再学習してください:\n"
+    if meta.get("version", 1) != META_VERSION:
+        raise SystemExit("保存済みモデルのスコア変換・温度較正は未対応です。再学習してください:\n"
                          "  python predict_model.py --train")
+    try:
+        validate_blend_models(True if meta.get("has_lgb") else None,
+                              float(meta.get("ensemble_weight", 0)),
+                              True if meta.get("has_mt") else None,
+                              float(meta.get("mt_weight", 0)))
+        temperature = float(meta["temperature"])
+        if not np.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Invalid temperature")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise SystemExit(f"保存済みモデルの較正情報が不正です。再学習してください: {exc}")
+    for flag, filename in (("has_lgb", LGB_MODEL_FILE), ("has_mt", MT_MODEL_FILE)):
+        optional_path = os.path.join(MODEL_DIR, filename)
+        if meta.get(flag) and not os.path.isfile(optional_path):
+            raise SystemExit(f"モデルファイルが見つかりません: {optional_path}。再学習してください。")
 
     path = os.path.join(MODEL_DIR, MODEL_FILE)
     if not os.path.exists(path):
@@ -1227,17 +1456,33 @@ def load_models():
 
     CAREER_SNAPSHOT = meta.get("career_snapshot", "post")
     DROP_CAREER = bool(meta.get("drop_career", False))
+    USE_PACE_FEATURES = bool(meta.get("use_pace_features", False))
     for k, v in meta.get("career_band_ranges", {}).items():
         CAREER_BAND_RANGES.setdefault(k, tuple(v))
 
+    lgb_model = None
+    if meta.get("has_lgb"):
+        lgb_path = os.path.join(MODEL_DIR, LGB_MODEL_FILE)
+        import lightgbm as lgb
+        lgb_model = lgb.Booster(model_file=lgb_path)
+
+    mt_model = None
+    if meta.get("has_mt"):
+        mt_path = os.path.join(MODEL_DIR, MT_MODEL_FILE)
+        mt_model = xgb.Booster()
+        mt_model.load_model(mt_path)
+        mt_model.set_param({"device": DEVICE})
+
     return (booster, meta["cat_maps"], meta["feature_cols"], meta["cat_cols"],
-            meta.get("personnel_stats", {}), float(meta.get("temperature", 1.0)))
+            meta.get("personnel_stats", {}), float(meta.get("temperature", 1.0)),
+            lgb_model, float(meta.get("ensemble_weight", 0.0)),
+            mt_model, float(meta.get("mt_weight", 0.0)))
 
 
 # ============================================================
 # 学習フェーズ
 # ============================================================
-def run_training():
+def run_training(no_lgb=True, no_mt=True):
     train_df = load_training_frame()
     finish = train_df["_finish"]
     X_enc, cat_cols, cat_maps, personnel_stats, groups = prepare_training_matrix(train_df)
@@ -1251,32 +1496,65 @@ def run_training():
               f"lr={XGB_DEFAULT_PARAMS['learning_rate']}, mcw={XGB_DEFAULT_PARAMS['min_child_weight']})")
 
     print("\nランキングモデル学習 & 時系列検証 ...")
-    model, temperature, _ = train_and_eval(X_enc, finish, groups, cat_cols)
+    model, temperature, _, lgb_model, ens_w, mt_model, mt_w = train_and_eval(
+        X_enc, finish, groups, cat_cols, use_lgb=not no_lgb, use_mt=not no_mt)
 
     print("\n学習済みモデルを保存中 ...")
-    save_models(model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature)
-    return model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature
+    save_models(model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature,
+                lgb_model=lgb_model, ensemble_weight=ens_w,
+                mt_model=mt_model, mt_weight=mt_w)
+    return (model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature,
+            lgb_model, ens_w, mt_model, mt_w)
 
 
 # ============================================================
 # 予測フェーズ
 # ============================================================
-def run_prediction(model, cat_maps, feature_cols, cat_cols, personnel_stats=None, temperature=1.0):
+def run_prediction(model, cat_maps, feature_cols, cat_cols, personnel_stats=None,
+                   temperature=1.0, lgb_model=None, ensemble_weight=0.0,
+                   mt_model=None, mt_weight=0.0, race_code=None, output_dir=None):
+    validate_blend_models(lgb_model, ensemble_weight, mt_model, mt_weight)
     personnel_stats = personnel_stats or {}
+    output_dir = os.fspath(output_dir) if output_dir is not None else OUT_DIR
+    os.makedirs(output_dir, exist_ok=True)
+    if race_code is not None and not re.fullmatch(r"[0-9]{10}", race_code):
+        raise ValueError("race-code must be a ten-digit URL code")
 
     print("\n" + "=" * 60)
     print("予測対象レースを処理中 ...")
     pred_files = sorted(glob.glob(os.path.join(PRED_DIR, "*.csv")))
+    if race_code is None and len(pred_files) > 1:
+        print(f"  [警告] {len(pred_files)} 個の予測対象ファイルがあります。"
+              f"単一レースに絞るには --race-code を使用してください。")
     if not pred_files:
         raise SystemExit("CSV_predict にデータがありません。")
 
     all_results = []
+    seen_codes = set()
 
     for f in pred_files:
         df = pd.read_csv(f, encoding="utf-8-sig", dtype=str)
         if df.empty:
             continue
-        df = normalize_career_columns(df)
+        if "URLコード" not in df.columns:
+            raise SystemExit(f"URLコード列がありません: {f}")
+        codes = df["URLコード"].astype("string").str.strip()
+        if codes.isna().any() or not codes.str.fullmatch(r"[0-9]{10}").all():
+            raise SystemExit(f"URLコードが不正です: {f}")
+        if race_code is not None:
+            df = df.loc[codes == race_code].copy()
+            if df.empty:
+                continue
+            codes = codes.loc[df.index]
+        if codes.nunique() != 1:
+            raise SystemExit(f"複数のURLコードがあります ({sorted(codes.unique())})。"
+                             f"--race-code で指定してください: {f}")
+        code = str(codes.iloc[0])
+        if code in seen_codes:
+            raise SystemExit(f"URLコードが複数ファイルにあります: {code}")
+        seen_codes.add(code)
+        df = normalize_career_columns(df).reset_index(drop=True)
+        df["URLコード"] = code
         Xp = build_features(df)
         Xp = add_personnel_features(Xp, df, personnel_stats)
 
@@ -1289,19 +1567,27 @@ def run_prediction(model, cat_maps, feature_cols, cat_cols, personnel_stats=None
 
         dmat = xgb.DMatrix(Xp_enc, enable_categorical=True)
         score = np.asarray(model.predict(dmat), dtype=float)
+        optional = None
+        if lgb_model is not None:
+            optional = lgb_model.predict(Xp_enc)
+        elif mt_model is not None:
+            optional = mt_model.predict(dmat)
+        score = blend_group_scores(score, df["URLコード"].values, optional,
+                                   ensemble_weight or mt_weight,
+                                   win_probabilities=mt_model is not None)
         p_win, p_top2, p_top3 = pl_topk_probs(score, temperature)
 
-        code = os.path.basename(f).split("_")[-1].replace(".csv", "")
         info = decode_url_code(code)
 
         res = pd.DataFrame({
             "開催日": f"{info['年']}年 第{info['回']}回{info['日']}日目",
             "競馬場": info["競馬場名"],
             "レース番号": f"{info['レース番号']}R",
+            "URLコード": code,
+            "枠番": df.get("枠番", pd.Series(np.nan, index=df.index)).apply(parse_num).astype("Int64"),
             "馬番": df["馬番"].apply(parse_num).astype("Int64"),
-            "馬名": df["馬名"],
-            "騎手": df.get("騎手", ""),
-            "スコア": score,
+            "馬名": df["馬名"].astype(str),
+            "騎手": df.get("騎手", ""),            "スコア": score,
             "1着確率": p_win,
             "2着以内確率": p_top2,
             "3着以内確率": p_top3,
@@ -1318,20 +1604,22 @@ def run_prediction(model, cat_maps, feature_cols, cat_cols, personnel_stats=None
         out["3着以内_順位"] = out["3着以内確率"].rank(ascending=False, method="min").astype(int)
         out = out.sort_values("1着確率", ascending=False)
         fname = f"pred_{info['年']}_第{info['回']}回{info['競馬場名']}{info['日']}日目_{info['レース番号']}R.csv"
-        out.to_csv(os.path.join(OUT_DIR, fname), index=False, encoding="utf-8-sig")
+        out.to_csv(os.path.join(output_dir, fname), index=False, encoding="utf-8-sig")
 
+    if race_code is not None and not all_results:
+        raise SystemExit(f"指定されたURLコードが見つかりません: {race_code}")
     if all_results:
         alldf = pd.concat(all_results, ignore_index=True)
-        alldf.to_csv(os.path.join(OUT_DIR, "_all_predictions.csv"), index=False, encoding="utf-8-sig")
+        alldf.to_csv(os.path.join(output_dir, "_all_predictions.csv"), index=False, encoding="utf-8-sig")
         print("\n" + "=" * 60)
-        print(f"完了。予測結果を {OUT_DIR} に保存しました。")
+        print(f"完了。予測結果を {output_dir} に保存しました。")
 
 
 # ============================================================
 # メイン
 # ============================================================
 def main():
-    global DEVICE, DROP_CAREER
+    global DEVICE, DROP_CAREER, USE_PACE_FEATURES
 
     parser = argparse.ArgumentParser(
         description="競馬 着順予測モデル（XGBoost LambdaRank / GPU）",
@@ -1343,10 +1631,26 @@ def main():
     parser.add_argument("--trials", type=int, default=50, help="--tune 時の探索試行回数（デフォルト: 50）")
     parser.add_argument("--drop-career", action="store_true",
                         help="通算成績・脚質集計（脚質:逃先差追）由来の特徴を使わない")
+    parser.add_argument("--lgb", action="store_true",
+                        help="実験的なLightGBMブレンド候補を検証する（デフォルトOFF）")
+    parser.add_argument("--win-blend", action="store_true",
+                        help="実験的な1着分類器ブレンド候補を検証する（デフォルトOFF）")
+    parser.add_argument("--pace", action="store_true",
+                        help="実験的な展開特徴を使う（デフォルトOFF）")
+    parser.add_argument("--race-code", help="予測する単一レースの10桁URLコード")
+    parser.add_argument("--output-dir", default=OUT_DIR, help="予測CSVの出力先")
+    parser.add_argument("--no-lgb", action="store_true",
+                        help="LightGBM アンサンブルを使わない（XGBoost 単体）")
+    parser.add_argument("--no-pace", action="store_true",
+                        help="展開（ペース）精緻化特徴を使わない")
+    parser.add_argument("--no-mt", action="store_true",
+                        help="1着分類器ブレンドを使わない（互換オプション）")
     args = parser.parse_args()
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    if args.race_code is not None and not re.fullmatch(r"[0-9]{10}", args.race_code):
+        parser.error("--race-code は10桁のURLコードを指定してください")
     DROP_CAREER = bool(args.drop_career)
+    USE_PACE_FEATURES = bool(args.pace and not args.no_pace)
 
     try:
         major = int(str(xgb.__version__).split(".")[0])
@@ -1365,16 +1669,29 @@ def main():
         run_tuning(n_trials=args.trials)
     elif args.predict_only:
         print("保存済みモデルを読み込み中 ...")
-        model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature = load_models()
-        print(f"  モデル読込完了（特徴量数: {len(feature_cols)}, 温度: {temperature:.3f}）")
-        run_prediction(model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature)
+        (model, cat_maps, feature_cols, cat_cols, personnel_stats,
+         temperature, lgb_model, ens_w, mt_model, mt_w) = load_models()
+        extras = []
+        if lgb_model is not None:
+            extras.append(f"LightGBM重み: {ens_w:.2f}")
+        if mt_model is not None:
+            extras.append(f"1着分類器ブレンド重み: {mt_w:.2f}")
+        print(f"  モデル読込完了（特徴量数: {len(feature_cols)}, 温度: {temperature:.3f}"
+              f"{', ' + ', '.join(extras) if extras else ''}）")
+        run_prediction(model, cat_maps, feature_cols, cat_cols, personnel_stats,
+                       temperature, lgb_model, ens_w, mt_model, mt_w,
+                       race_code=args.race_code, output_dir=args.output_dir)
     elif args.train:
-        run_training()
+        run_training(no_lgb=not args.lgb or args.no_lgb, no_mt=not args.win_blend or args.no_mt)
         print("\n" + "=" * 60)
         print("学習が完了しました。予測するには:  python predict_model.py --predict-only")
     else:
-        model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature = run_training()
-        run_prediction(model, cat_maps, feature_cols, cat_cols, personnel_stats, temperature)
+        (model, cat_maps, feature_cols, cat_cols, personnel_stats,
+         temperature, lgb_model, ens_w, mt_model, mt_w) = run_training(
+             no_lgb=not args.lgb or args.no_lgb, no_mt=not args.win_blend or args.no_mt)
+        run_prediction(model, cat_maps, feature_cols, cat_cols, personnel_stats,
+                       temperature, lgb_model, ens_w, mt_model, mt_w,
+                       race_code=args.race_code, output_dir=args.output_dir)
 
 
 if __name__ == "__main__":
