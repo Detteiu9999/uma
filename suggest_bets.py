@@ -13,6 +13,7 @@ predictions/ の予測確率（1着/2着以内/3着以内）と odds/ の最新�
 
 確率の計算:
   ・単勝/複勝         : その馬の 1着確率 / 3着以内確率
+    （複勝は出走7頭以下のレースでは2着までが払い戻し対象のため 2着以内確率を使用）
   ・枠連/馬連/馬単/3連複/3連単/ワイド:
       各馬の 1着確率を強さとした Plackett–Luce モデルによる推定。
       枠連は全出走馬の馬単確率を、対象の枠組合せについて合算する。
@@ -44,6 +45,7 @@ PROB_THRESHOLD = 0.1     # この確率を下回る馬は関連買い目から�
 DEFAULT_MIN_EV = 1.0     # 期待値の下限（これ以上を提案）
 
 DISCORD_BET_RULES = {
+    "枠連": (0.15, 2.0, math.inf),
     "馬連": (0.15, 1.0, math.inf),
     "馬単": (0.1, 1.0, 1.5),
     "3連複": (0.125, 1.5, 3.0),
@@ -271,6 +273,11 @@ def suggest_for_race(horses, odds_for_race, min_ev, use_harville=True,
     # --- 単勝・複勝 ---
     df = odds_for_race.get("tanpuku")
     if df is not None:
+        # 複勝の払い戻し対象は出走頭数で変わる（8頭以上: 3着まで / 7頭以下: 2着まで）
+        small_field = len(horses) <= 7
+        place_note = "複勝オッズは下限値で評価"
+        if small_field:
+            place_note += "（7頭以下のため2着までが的中）"
         for _, row in df.iterrows():
             try:
                 num = int(row["馬番"])
@@ -281,10 +288,10 @@ def suggest_for_race(horses, odds_for_race, min_ev, use_harville=True,
                 continue
             if h.ok_win:
                 add("単勝", f"{num} {h.name}", h.p1, row.get("単勝オッズ"))
-            if h.ok_place3:
+            if h.ok_place2 if small_field else h.ok_place3:
                 # 複勝オッズは幅があるため下限（堅め）で評価
-                add("複勝", f"{num} {h.name}", h.p3, row.get("複勝オッズ下限"),
-                    note="複勝オッズは下限値で評価")
+                add("複勝", f"{num} {h.name}", h.p2 if small_field else h.p3,
+                    row.get("複勝オッズ下限"), note=place_note)
 
     # --- 枠連 ---
     df = odds_for_race.get("wakuren")

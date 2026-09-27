@@ -194,7 +194,7 @@ class SuggestionTests(unittest.TestCase):
         for invalid in (float("nan"), float("inf"), float("-inf"), -1, 1.1):
             with self.subTest(probability=invalid):
                 horses = make_horses([0.5, 0.5])
-                horses[0].p3 = invalid
+                horses[0].p2 = invalid  # 7頭以下のため複勝は2着以内確率で評価
                 odds = {"tanpuku": pd.DataFrame([{"馬番": 1, "複勝オッズ下限": 10}])}
                 self.assertEqual(bets.suggest_for_race(horses, odds, 0), [])
         odds = {"umaren": pd.DataFrame([{"馬番1": 1, "馬番2": 2, "馬連オッズ": 10}])}
@@ -203,6 +203,30 @@ class SuggestionTests(unittest.TestCase):
                 self.assertEqual(bets.suggest_for_race(make_horses([0.5, 0.5]), odds, 0), [])
         with self.assertRaises(ValueError):
             bets.suggest_for_race(make_horses([0, 0]), {}, 0)
+
+    def test_place_field_size_rule(self):
+        # 出走7頭以下のレースでは複勝の払い戻し対象は2着まで（2着以内確率で評価）
+        odds = {"tanpuku": pd.DataFrame([{"馬番": 1, "複勝オッズ下限": 10}])}
+        for field in (7, 8):
+            with self.subTest(field=field):
+                horses = make_horses([0.4] + [0.1] * (field - 1))
+                horses[0].p2, horses[0].p3 = 0.4, 0.7
+                (bet,) = bets.suggest_for_race(horses, odds, 0)
+                self.assertEqual(bet["式別"], "複勝")
+                if field <= 7:
+                    self.assertEqual(bet["的中確率(推定)"], 0.4)
+                    self.assertIn("2着まで", bet["備考"])
+                else:
+                    self.assertEqual(bet["的中確率(推定)"], 0.7)
+                    self.assertNotIn("2着まで", bet["備考"])
+        # 7頭以下では2着以内確率が閾値未満の馬は複勝から除外される
+        horses = make_horses([0.4] + [0.1] * 6)
+        horses[0].p2, horses[0].p3 = 0.05, 0.9
+        self.assertEqual(bets.suggest_for_race(horses, odds, 0), [])
+        horses8 = make_horses([0.4] + [0.1] * 7)
+        horses8[0].p2, horses8[0].p3 = 0.05, 0.9
+        (bet,) = bets.suggest_for_race(horses8, odds, 0)
+        self.assertEqual(bet["的中確率(推定)"], 0.9)
 
     def test_duplicate_horses_and_combinations(self):
         horses = make_horses([0.4, 0.3, 0.3])
@@ -235,6 +259,17 @@ class ResultTests(unittest.TestCase):
                                                    {1: 1, 2: 1, 3: 2}))
         for combo in (None, float("nan"), "", '=\"1-2', '=SUM(1,2)', '="bad"'):
             self.assertIsNone(results.parse_combo("馬連", combo))
+
+    def test_place_field_size_result_rule(self):
+        # 複勝の的中判定: 出走7頭以下は2着まで、8頭以上は3着まで
+        finish7 = {i: i for i in range(1, 8)}
+        finish8 = {i: i for i in range(1, 9)}
+        self.assertTrue(results.is_hit("複勝", "2 Horse", finish7, {}))
+        self.assertFalse(results.is_hit("複勝", "3 Horse", finish7, {}))
+        self.assertTrue(results.is_hit("複勝", "3 Horse", finish8, {}))
+        # starters 引数で出走頭数を指定できる（中止馬がいても出走頭数ベースで判定）
+        self.assertTrue(results.is_hit("複勝", "3 Horse", finish7, {}, starters=8))
+        self.assertFalse(results.is_hit("複勝", "3 Horse", finish8, {}, starters=7))
 
     def test_single_race_cli_filters(self):
         df = pd.DataFrame([{

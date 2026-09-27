@@ -108,10 +108,12 @@ def parse_combo(bet_type, combo):
     return None
 
 
-def is_hit(bet_type, combo, finish, waku_map):
+def is_hit(bet_type, combo, finish, waku_map, starters=None):
     """
     買い目が的中したか判定する。
     finish: {馬番: 着順}  waku_map: {馬番: 枠番}
+    starters: 出走頭数（複勝の的中条件が7頭以下で2着までに変わるため。
+              省略時は着順が取れた頭数で代用）
     """
     nums = parse_combo(bet_type, combo)
     if nums is None:
@@ -128,7 +130,9 @@ def is_hit(bet_type, combo, finish, waku_map):
     if bet_type == "単勝":
         return nums[0] == top1
     if bet_type == "複勝":
-        return finish.get(nums[0], 99) <= 3
+        # 出走7頭以下のレースでは2着までが払い戻し対象
+        field = starters if starters is not None else len(finish)
+        return finish.get(nums[0], 99) <= (2 if field <= 7 else 3)
     if bet_type == "枠連":
         w1, w2 = waku_map.get(top1), waku_map.get(top2)
         if w1 is None or w2 is None:
@@ -196,7 +200,9 @@ def main():
     print()
 
     # 枠番マップ（枠連判定用）: 結果CSVの枠番を使う
+    # 出走頭数（複勝判定用）: 結果CSVの行数（中止馬も出走頭数に含める）
     waku_maps = {}
+    starters = {}
     for path in glob.glob(os.path.join(kekka_dir, "horse_racing_data_*.csv")):
         try:
             kdf = pd.read_csv(path, encoding="utf-8-sig")
@@ -210,6 +216,7 @@ def main():
         key = (place, int(kdf["回"].iloc[0]), int(kdf["日"].iloc[0]), int(kdf["レース"].iloc[0]))
         waku_maps[key] = {int(r["馬番"]): int(r["枠番"]) for _, r in kdf.iterrows()
                           if str(r["馬番"]).strip() and str(r["枠番"]).strip()}
+        starters[key] = len(kdf)
 
     total_bet = 0
     total_return = 0.0
@@ -228,7 +235,8 @@ def main():
             unknown += 1
             print(f"[未照合] {key} 式別={bet_type} 買い目={combo}")
             continue
-        hit = is_hit(bet_type, combo, finish, waku_maps.get(key, {}))
+        hit = is_hit(bet_type, combo, finish, waku_maps.get(key, {}),
+                     starters.get(key))
         if hit is None:
             unknown += 1
             continue

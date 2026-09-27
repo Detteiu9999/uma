@@ -13,15 +13,15 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from discord_webhook_url import DISCORD_SCHEDULE_WEBHOOK_URL, DISCORD_WEBHOOK_URL
 from fetch_odds import PLACE_NAMES, fetch_live_race_odds, normalize_race_id
 from suggest_bets import Horse, suggest_for_race
 
 JST = timezone(timedelta(hours=9))
 BASE_DIR = Path(__file__).resolve().parent
 NETKEIBA_URL = "https://race.netkeiba.com/race/shutuba.html"
-DISCORD_WEBHOOK_URL = (
-    "https://discord.com/api/webhooks/1550427299026051172/LB_ZE6LasghBXObtBjJQ9JXOyMwnsL9L8aGRZfQdpOF8CPE-xk2YDFTXnBz9gK1RgS8w"
-)
+NETKEIBA_RESULT_URL = "https://race.netkeiba.com/race/result.html"
+RESULT_WAIT_MINUTES = 60  # 最終レース発走後に結果取得を待つ上限時間
 
 @dataclass(frozen=True)
 class Race:
@@ -30,10 +30,12 @@ class Race:
     start: datetime
 
     @property
+    def short_label(self):
+        return f"{PLACE_NAMES[int(self.race_id[4:6])]} {int(self.race_id[-2:])}R"
+
+    @property
     def label(self):
-        return (f"{PLACE_NAMES[int(self.race_id[4:6])]} "
-                f"{int(self.race_id[-2:])}R {self.name} "
-                f"発走 {self.start:%Y/%m/%d %H:%M} JST")
+        return f"{self.short_label} {self.name} 発走 {self.start:%Y/%m/%d %H:%M} JST"
 
 
 def discover_race_ids(predict_dir):
@@ -79,6 +81,89 @@ def fetch_schedule(race_id, session):
     return parse_race_page(race_id, response.text)
 
 
+# 払戻テーブルの行クラス → 式別
+PAYOUT_ROW_CLASSES = {
+    "Tansho": "単勝", "Fukusho": "複勝", "Wakuren": "枠連", "Umaren": "馬連",
+    "Wide": "ワイド", "Umatan": "馬単", "Fuku3": "3連複", "Tan3": "3連単",
+}
+UNORDERED_BETS = {"枠連", "馬連", "ワイド", "3連複"}
+
+
+def parse_race_result(race_id, html):
+    """結果ページの払戻テーブルを解析する。
+    戻り値: {式別: [(買い目タプル, 100円あたり払戻額), ...]}（順不同の式別は昇順に正規化）
+    結果未確定（払戻テーブルなし）の場合は ValueError。"""
+    race_id = normalize_race_id(race_id)
+    soup = BeautifulSoup(html, "html.parser")
+    payouts = {}
+    for row in soup.select("table.Payout_Detail_Table tr"):
+        classes = row.get("class") or []
+        bet_type = next((name for cls, name in PAYOUT_ROW_CLASSES.items() if cls in classes), None)
+        result_td = row.find("td", class_="Result")
+        payout_td = row.find("td", class_="Payout")
+        if not bet_type or not result_td or not payout_td:
+            continue
+        combos = []
+        if bet_type in ("単勝", "複勝"):
+            combos = [(int(div.get_text(strip=True)),) for div in result_td.find_all("div")
+                      if div.get_text(strip=True).isdigit()]
+        else:
+            for ul in result_td.find_all("ul"):
+                nums = tuple(int(li.get_text(strip=True)) for li in ul.find_all("li")
+                             if li.get_text(strip=True).isdigit())
+                if nums:
+                    combos.append(tuple(sorted(nums)) if bet_type in UNORDERED_BETS else nums)
+        values = [int(m.group(1).replace(",", ""))
+                  for text in payout_td.stripped_strings
+                  if (m := re.fullmatch(r"([0-9][0-9,]*)円?", text))]
+        entries = list(zip(combos, values))
+        if entries:
+            payouts.setdefault(bet_type, []).extend(entries)
+    if not payouts:
+        raise ValueError("払戻情報を取得できません（結果未確定の可能性）")
+    return payouts
+
+
+def fetch_race_result(race_id, session):
+    response = session.get(NETKEIBA_RESULT_URL, params={"race_id": race_id, "rf": "race_list"}, timeout=20)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding
+    return parse_race_result(race_id, response.text)
+
+
+def parse_suggestion_combo(bet_type, combo):
+    """買い目文字列を照合用のタプルに変換する（順不同の式別は昇順に正規化）。"""
+    match = None
+    if bet_type in ("単勝", "複勝"):
+        match = re.match(r"(\d+)", str(combo).strip())
+    elif bet_type == "枠連":
+        match = re.fullmatch(r"枠(\d+)-枠(\d+)", str(combo).strip())
+    elif bet_type in ("馬連", "ワイド", "3連複"):
+        match = re.fullmatch(r"(\d+)-(\d+)(?:-(\d+))?", str(combo).strip())
+    elif bet_type in ("馬単", "3連単"):
+        match = re.fullmatch(r"(\d+)→(\d+)(?:→(\d+))?", str(combo).strip())
+    if not match:
+        return None
+    nums = tuple(int(n) for n in match.groups() if n is not None)
+    return tuple(sorted(nums)) if bet_type in UNORDERED_BETS else nums
+
+
+def evaluate_bets(bets, payouts, stake=100):
+    """1レース分の買い目を確定払戻と照合し、購入点数・的中・払戻を集計する。"""
+    hits = []
+    for bet in bets:
+        combo = parse_suggestion_combo(bet.get("式別"), bet.get("買い目"))
+        if combo is None:
+            continue
+        for win_combo, value in payouts.get(bet["式別"], []):
+            if win_combo == combo:
+                hits.append({"式別": bet["式別"], "買い目": bet["買い目"],
+                             "払戻": value * stake // 100})
+                break
+    return {"points": len(bets), "bet": stake * len(bets), "hits": hits,
+            "hit_count": len(hits), "return": sum(hit["払戻"] for hit in hits)}
+
+
 def load_race_horses(race_id, base_dir):
     year, place, kai, day, number = (int(race_id[:4]), int(race_id[4:6]),
                                    int(race_id[6:8]), int(race_id[8:10]), int(race_id[10:]))
@@ -110,7 +195,7 @@ def build_messages(race, suggestions, error=None):
             lines.append("\n複勝・ワイドはオッズ下限値で評価。")
 
     messages = []
-    current = "\n" + header  # 先頭に空行を入れる
+    current = "_ _\n" + header  # 先頭に空行を入れる
 
     for line in lines:
         if len(current) + len(line) + 1 > 1900:
@@ -158,6 +243,126 @@ def save_state(path, state):
     temp.replace(path)
 
 
+def build_schedule_messages(races):
+    """発走時刻順に並べた本日のレース一覧を、等幅のコードブロック表にして作る。"""
+    first_start = min(race.start for race in races)
+    header = f"本日のスケジュール ({first_start:%Y/%m/%d})"
+    lines = [f"{race.start:%H:%M} {PLACE_NAMES[int(race.race_id[4:6])]} "
+             f"{int(race.race_id[-2:]):>2}R {race.name}"
+             for race in sorted(races, key=lambda r: (r.start, r.race_id))]
+    messages = []
+    current = "_ _\n" + header + "\n```"  # 先頭に空行を入れる
+    for line in lines:
+        # 閉じフェンス("\n```")の分を残して1900文字以内に収める
+        if len(current) + len(line) + 5 > 1900:
+            messages.append(current + "\n```")
+            current = "\n" + header + "\n```"  # 分割後のメッセージにも空行を入れる
+        current += "\n" + line
+    messages.append(current + "\n```")
+    return messages
+
+
+def post_schedule(races, webhook, base_dir=BASE_DIR):
+    """本日のレーススケジュール（発走時刻順）をスケジュール用チャンネルに投稿する。"""
+    if not races:
+        return
+    first_start = min(race.start for race in races)
+    state_path = Path(base_dir) / "suggestions" / "discord_state" / f"schedule_{first_start:%Y%m%d}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    if state.get("done"):
+        return
+    with requests.Session() as session:
+        for message in build_schedule_messages(races):
+            send_discord(webhook, message, session)
+    state["done"] = True
+    save_state(state_path, state)
+    print("本日のスケジュールをDiscordに投稿しました", flush=True)
+
+
+def build_summary_messages(date, race_by_id, per_race, missing):
+    total_points = sum(result["points"] for _, result in per_race)
+    total_bet = sum(result["bet"] for _, result in per_race)
+    total_return = sum(result["return"] for _, result in per_race)
+    total_hits = sum(result["hit_count"] for _, result in per_race)
+    lines = []
+    if total_points:
+        lines.append("全買い目を100円ずつ購入したと仮定")
+        lines.append(f"購入: {total_points}点 {total_bet:,}円 / 的中: {total_hits}点")
+        lines.append(f"払戻: {total_return:,}円 / 収支: {total_return - total_bet:+,}円")
+        lines.append(f"回収率: {total_return / total_bet * 100:.1f}%")
+        hits = [(race_id, hit) for race_id, result in per_race for hit in result["hits"]]
+        if hits:
+            lines.append("\n的中した買い目:")
+            for race_id, hit in hits:
+                lines.append(f"{race_by_id[race_id].short_label} {hit['式別']} "
+                             f"{hit['買い目']} → {hit['払戻']:,}円")
+    else:
+        lines.append("本日の買い目はありませんでした。")
+    if missing:
+        labels = "、".join(race_by_id[race_id].short_label for race_id in missing)
+        lines.append(f"\n※結果を取得できなかったため集計対象外: {labels}")
+    header = f"本日の回収率 ({date:%Y/%m/%d})"
+    messages = []
+    current = "_ _\n" + header  # 先頭に空行を入れる
+    for line in lines:
+        if len(current) + len(line) + 1 > 1900:
+            messages.append(current)
+            current = "\n" + header  # 分割後のメッセージにも空行を入れる
+        current += "\n" + line
+    messages.append(current)
+    return messages
+
+
+def summarize_day(races, webhook, base_dir=BASE_DIR, now=None, sleep=time.sleep):
+    """全レース終了後に、投稿した全買い目を100円ずつ購入したと仮定した
+    本日の収支・回収率をDiscordに投稿する。"""
+    if not races:
+        return
+    now = now or (lambda: datetime.now(JST))
+    last_start = max(race.start for race in races)
+    state_path = Path(base_dir) / "suggestions" / "discord_state" / f"summary_{last_start:%Y%m%d}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    if state.get("done"):
+        return
+    race_by_id = {race.race_id: race for race in races}
+    bets_by_race = {}
+    for race in races:
+        race_state_path = state_path.parent / f"{race.race_id}.json"
+        if race_state_path.exists():
+            race_state = json.loads(race_state_path.read_text(encoding="utf-8"))
+            if race_state.get("bets"):
+                bets_by_race[race.race_id] = race_state["bets"]
+    results = {}
+    deadline = last_start + timedelta(minutes=RESULT_WAIT_MINUTES)
+    with requests.Session() as session:
+        session.headers["User-Agent"] = "Mozilla/5.0"
+        pending = set(bets_by_race)
+        while pending:
+            for race_id in sorted(pending):
+                try:
+                    results[race_id] = fetch_race_result(race_id, session)
+                    pending.discard(race_id)
+                    print(f"[{race_id}] 結果を取得しました", flush=True)
+                except Exception as exc:
+                    print(f"[{race_id}] 結果はまだ取得できません ({type(exc).__name__})", flush=True)
+                sleep(1)
+            if pending and now() < deadline:
+                print(f"結果待ち: {len(pending)}レース。1分後に再取得します", flush=True)
+                sleep(60)
+            else:
+                break
+        if pending:
+            print(f"結果を取得できなかったレース: {', '.join(sorted(pending))}", flush=True)
+        per_race = [(race_id, evaluate_bets(bets, results[race_id]))
+                    for race_id, bets in sorted(bets_by_race.items()) if race_id in results]
+        messages = build_summary_messages(last_start, race_by_id, per_race, sorted(pending))
+        for message in messages:
+            send_discord(webhook, message, session)
+    state["done"] = True
+    save_state(state_path, state)
+    print("本日の回収率をDiscordに投稿しました", flush=True)
+
+
 def process_race(race, webhook, base_dir=BASE_DIR, now=None):
     now = now or (lambda: datetime.now(JST))
     state_path = Path(base_dir) / "suggestions" / "discord_state" / f"{race.race_id}.json"
@@ -172,8 +377,9 @@ def process_race(race, webhook, base_dir=BASE_DIR, now=None):
             messages = build_messages(race, bets)
         except Exception as exc:
             print(f"[{race.race_id}] 取得・計算失敗 ({type(exc).__name__})")
+            bets = []
             messages = build_messages(race, [], "予測CSV・最新オッズの取得または計算に失敗しました。ログを確認してください")
-        state = {"messages": messages, "sent": 0, "done": False}
+        state = {"messages": messages, "bets": bets, "sent": 0, "done": False}
         save_state(state_path, state)
     with requests.Session() as session:
         while state["sent"] < len(state["messages"]):
@@ -191,10 +397,11 @@ def due(race, now):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CSV_predictのレースを発走5分前に処理してDiscord通知（JST）")
+    parser = argparse.ArgumentParser(description="CSV_predictのレーススケジュールを別チャンネルに投稿し、発走5分前に買い目をDiscord通知、全レース終了後に本日の回収率を投稿（JST）")
     parser.add_argument("--list", action="store_true", help="発走日時を取得・表示して終了（送信なし）")
     args = parser.parse_args()
     webhook = None
+    schedule_webhook = None
     if not args.list:
         try:
             webhook = validate_webhook(DISCORD_WEBHOOK_URL)
@@ -203,6 +410,14 @@ def main():
                 "コード内の DISCORD_WEBHOOK_URL をDiscordのWebhook URLに置き換えてください: "
                 + str(exc)
             )
+        if DISCORD_SCHEDULE_WEBHOOK_URL:
+            try:
+                schedule_webhook = validate_webhook(DISCORD_SCHEDULE_WEBHOOK_URL)
+            except ValueError as exc:
+                parser.error(
+                    "コード内の DISCORD_SCHEDULE_WEBHOOK_URL をDiscordのWebhook URLに置き換えてください: "
+                    + str(exc)
+                )
     races = []
     failed = []
     with requests.Session() as session:
@@ -220,6 +435,10 @@ def main():
         raise SystemExit("発走日時を取得できないレースがあります。確認後、再実行してください。")
     if args.list:
         return
+    if schedule_webhook:
+        post_schedule(races, schedule_webhook)
+    else:
+        print("DISCORD_SCHEDULE_WEBHOOK_URL 未設定のためスケジュール投稿をスキップします", flush=True)
     pending = {race.race_id: race for race in races if race.start > datetime.now(JST)}
     running = {}
     retry_at = {}
@@ -245,6 +464,7 @@ def main():
                     running[race_id] = executor.submit(process_race, race, webhook)
             if pending or running:
                 time.sleep(1)
+    summarize_day(races, webhook)
 
 
 if __name__ == "__main__":

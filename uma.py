@@ -14,7 +14,7 @@ from datetime import date
 TARGET_YEARS = [26]
 PLACES = [6,9]
 KAIS = [4]
-DAYS = [5]
+DAYS = [9]
 RACES = range(1, 13)
 
 BASE_URL = "https://jiro8.sakura.ne.jp/index.php?code="
