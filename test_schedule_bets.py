@@ -1,6 +1,7 @@
 import json
 import math
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import fetch_odds
+import ipat_auto_bet
 import schedule_bets as scheduler
 from suggest_bets import DISCORD_BET_RULES, Horse, meets_discord_rules, suggest_for_race
 
@@ -70,6 +72,15 @@ class ScheduleTests(unittest.TestCase):
         for value in ["202611040601", "202606040613", "invalid"]:
             with self.assertRaises(ValueError):
                 fetch_odds.normalize_race_id(value)
+
+    def test_obstacle_detection(self):
+        base = '<div id="RaceList_DateList"><li class="Active"><a href="?kaisai_date=20260920">9月20日</a></li></div><div class="RaceName">テストレース</div>'
+        for course, expected in [("障3000m", True), ("障害3000m", True), ("芝1600m", False),
+                                  ("ダ1200m", False), ("芝・ダ1400m", False)]:
+            html = f'<div class="RaceData01">{course} 10:00発走</div>' + base
+            race = scheduler.parse_race_page("202606040601", html)
+            self.assertEqual(race.is_obstacle, expected, course)
+        self.assertFalse(scheduler.is_obstacle_race("<html></html>"))
 
     def test_due_boundaries(self):
         self.assertFalse(scheduler.due(self.race, self.now() - timedelta(seconds=1)))
@@ -287,6 +298,205 @@ class ResultSummaryTests(unittest.TestCase):
         self.assertEqual(state["bets"], [{"式別": "複勝", "買い目": "1 馬1", "的中確率(推定)": 0.7,
                                           "オッズ": 2.0, "期待値": 1.4,
                                           "備考": "複勝オッズは下限値で評価（7頭以下のため2着までが的中）"}])
+
+
+class AutoBetTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.race = scheduler.Race("202606040601", "テストレース",
+                                   datetime(2026, 9, 20, 10, tzinfo=scheduler.JST))
+        self.obstacle_race = scheduler.Race("202606040601", "障害レース",
+                                            datetime(2026, 9, 20, 10, tzinfo=scheduler.JST),
+                                            is_obstacle=True)
+        self.state_path = self.base / "suggestions" / "discord_state" / f"{self.race.race_id}.json"
+
+    def test_parse_bet_combo(self):
+        parse = ipat_auto_bet.parse_bet_combo
+        self.assertEqual(parse("単勝", "3 馬名"), (3,))
+        self.assertEqual(parse("複勝", "14 馬名"), (14,))
+        self.assertEqual(parse("枠連", "枠2-枠1"), (1, 2))
+        self.assertEqual(parse("馬連", "10-2"), (2, 10))
+        self.assertEqual(parse("ワイド", "3-5"), (3, 5))
+        self.assertEqual(parse("馬単", "2→1"), (2, 1))
+        self.assertEqual(parse("3連複", "14-2-1"), (1, 2, 14))
+        self.assertEqual(parse("3連単", "2→1→14"), (2, 1, 14))
+        for bet_type, combo in [("馬連", "1-1"), ("枠連", "枠0-枠2"), ("単勝", "19 馬"),
+                                 ("3連複", "1-2"), ("馬単", "1-2"), ("不明", "1-2")]:
+            self.assertIsNone(parse(bet_type, combo), (bet_type, combo))
+
+    def test_build_nb(self):
+        build = ipat_auto_bet.build_nb
+        # 中山(6) 日曜(1) 7R 単勝1番 100円
+        # ※金額フィールドは100円単位のhex（100円="0001"。js740: 入力欄が「～00円」表記）
+        self.assertEqual(build("6", "1", 7, "単勝", (1,), 100),
+                         "100067101800000000000000001")
+        # 馬連 1-2（2着目ビットは 0x20000 >> (n-1)）
+        self.assertEqual(build("6", "1", 7, "馬連", (1, 2), 100),
+                         "100067104800010000000000001")
+        # 3連複 1-2-3
+        self.assertEqual(build("6", "1", 12, "3連複", (1, 2, 3), 100),
+                         "10006C107800010000200000001")
+        # 枠連 2-3
+        nb = build("6", "1", 7, "枠連", (2, 3), 100)
+        self.assertEqual(len(nb), 27)
+        self.assertEqual(nb[:9], "100067103")
+        # 3連複・3連単・ワイド・複勝・馬単も27文字
+        for bet_type, combo in [("複勝", (5,)), ("ワイド", (1, 18)), ("馬単", (3, 4)),
+                                 ("3連複", (1, 2, 3)), ("3連単", (18, 17, 16))]:
+            self.assertEqual(len(build("9", "1", 12, bet_type, combo, 100)), 27)
+
+    def test_auto_bet_skip_obstacle(self):
+        state = {"bets": [{"式別": "単勝", "買い目": "1 馬"}], "messages": []}
+        with patch.object(scheduler, "buy_race_bets") as buy:
+            result = scheduler.auto_bet_race(self.obstacle_race, state, self.state_path)
+            buy.assert_not_called()
+        self.assertIsNone(result)
+        self.assertTrue(state["auto_bet_done"])
+        self.assertIn("障害", state["auto_bet_result"])
+
+    def test_auto_bet_success(self):
+        state = {"bets": [{"式別": "馬連", "買い目": "1-2"}], "messages": []}
+        with patch.object(scheduler, "buy_race_bets", return_value=1) as buy:
+            result = scheduler.auto_bet_race(self.race, state, self.state_path)
+        self.assertEqual(result, "IPATで 1点 100円を自動購入しました")
+        buy.assert_called_once_with(self.race.race_id, state["bets"],
+                                    yen=scheduler.AUTO_BET_YEN, session=None)
+        self.assertTrue(state["auto_bet_done"])
+
+    def test_auto_bet_failure_retries(self):
+        state = {"bets": [{"式別": "馬連", "買い目": "1-2"}], "messages": []}
+        with patch.object(scheduler, "buy_race_bets",
+                          side_effect=ipat_auto_bet.IpatError("通信失敗")):
+            with self.assertRaises(RuntimeError):
+                scheduler.auto_bet_race(self.race, state, self.state_path)
+        self.assertFalse(state.get("auto_bet_done", False))
+
+    def test_process_race_auto_bet(self):
+        ScheduleTests.predictions(self)
+        odds = {"tanpuku": pd.DataFrame([{"馬番": 1, "単勝オッズ": 50, "複勝オッズ下限": 2}])}
+        now = lambda: self.race.start - timedelta(minutes=5)
+        ipat_session = object()  # 共有セッションがそのまま buy_race_bets に渡ることを確認
+        with patch.object(scheduler, "fetch_live_race_odds", return_value=odds), \
+                patch.object(scheduler, "send_discord") as send, \
+                patch.object(scheduler, "buy_race_bets", return_value=1) as buy:
+            scheduler.process_race(self.race, "https://discord.com/api/webhooks/123/secret",
+                                   self.base, now, auto_bet=True, ipat_session=ipat_session)
+            buy.assert_called_once()
+            self.assertIs(buy.call_args.kwargs["session"], ipat_session)
+            messages = [call.args[1] for call in send.call_args_list]
+            self.assertTrue(any("自動購入" in m for m in messages))
+            # 2回目は購入しない
+            scheduler.process_race(self.race, "https://discord.com/api/webhooks/123/secret",
+                                   self.base, now, auto_bet=True, ipat_session=ipat_session)
+            buy.assert_called_once()
+
+    # -- buy_race_bets（セッション共有） -------------------------------------
+
+    def _mock_ipat_session(self):
+        session = Mock()
+        session.lock = threading.Lock()
+        session.stale.return_value = False
+        meeting = {"jyo_char": "6", "week_char": "1", "kai": 4, "day": 9,
+                   "jyo_index": 0, "letter": "A", "races": []}
+        session.find_meeting.return_value = meeting
+        return session, meeting
+
+    def test_buy_race_bets_shared_session(self):
+        # 共有セッションではログイン・クローズを行わず、そのまま投票する
+        session, meeting = self._mock_ipat_session()
+        session.place_bets.return_value = 2
+        bets = [{"式別": "馬連", "買い目": "10-2"}, {"式別": "単勝", "買い目": "3 馬名"}]
+        points = ipat_auto_bet.buy_race_bets("202606040907", bets, session=session)
+        self.assertEqual(points, 2)
+        session.login.assert_not_called()
+        session.close.assert_not_called()
+        session.find_meeting.assert_called_once_with(6, 4, 9)
+        session.place_bets.assert_called_once_with(
+            meeting, 7, [("馬連", (2, 10)), ("単勝", (3,))], ipat_auto_bet.UNIT_YEN)
+
+    def test_buy_race_bets_relogin_on_session_expired(self):
+        # 共有セッション切れ時は再ログインして1回だけ再試行する
+        session, _ = self._mock_ipat_session()
+        session.place_bets.side_effect = [ipat_auto_bet.IpatSessionExpired("切れ"), 1]
+        points = ipat_auto_bet.buy_race_bets("202606040907",
+                                             [{"式別": "馬連", "買い目": "1-2"}], session=session)
+        self.assertEqual(points, 1)
+        session.login.assert_called_once_with()
+        self.assertEqual(session.place_bets.call_count, 2)
+
+    def test_buy_race_bets_relogin_only_once(self):
+        # 再試行でもセッション切れなら諦めて例外を投げる（無限リトライしない）
+        session, _ = self._mock_ipat_session()
+        session.place_bets.side_effect = ipat_auto_bet.IpatSessionExpired("切れ")
+        with self.assertRaises(ipat_auto_bet.IpatSessionExpired):
+            ipat_auto_bet.buy_race_bets("202606040907",
+                                        [{"式別": "馬連", "買い目": "1-2"}], session=session)
+        session.login.assert_called_once_with()
+
+    def test_buy_race_bets_no_relogin_on_other_errors(self):
+        # セッション切れ以外のエラー（発売締切など）では再ログインしない
+        session, _ = self._mock_ipat_session()
+        session.place_bets.side_effect = ipat_auto_bet.IpatError("発売中ではありません")
+        with self.assertRaises(ipat_auto_bet.IpatError):
+            ipat_auto_bet.buy_race_bets("202606040907",
+                                        [{"式別": "馬連", "買い目": "1-2"}], session=session)
+        session.login.assert_not_called()
+        session.place_bets.assert_called_once()
+
+    def test_buy_race_bets_own_session(self):
+        # セッション未指定時は自分でログインし、終了時にクローズする
+        with patch.object(ipat_auto_bet, "IpatSession") as cls:
+            session = cls.return_value
+            session.find_meeting.return_value = {"jyo_char": "6", "week_char": "1"}
+            session.place_bets.return_value = 1
+            points = ipat_auto_bet.buy_race_bets("202606040907", [{"式別": "馬連", "買い目": "1-2"}])
+        self.assertEqual(points, 1)
+        session.login.assert_called_once_with()
+        session.close.assert_called_once_with()
+
+    def test_buy_race_bets_relogin_when_stale(self):
+        # 共有セッションが長時間アイドル（stale）なら、投票前にログインし直す
+        session, _ = self._mock_ipat_session()
+        session.stale.return_value = True
+        session.place_bets.return_value = 1
+        points = ipat_auto_bet.buy_race_bets("202606040907",
+                                             [{"式別": "馬連", "買い目": "1-2"}], session=session)
+        self.assertEqual(points, 1)
+        session.login.assert_called_once_with()
+        session.place_bets.assert_called_once()  # 事前再ログインのみ（リトライではない）
+
+    def _place_bets_session(self, response_html):
+        """place_bets 本体をテストするため、実セッションの通信層だけをモック化する"""
+        session = ipat_auto_bet.IpatSession(sleep=lambda s: None)
+        meeting = {"jyo_char": "6", "week_char": "1", "kai": 4, "day": 9,
+                   "jyo_index": 0, "letter": "A",
+                   "races": ["0950120" + "0" * 19] * 12}  # [4:6]!=00, [6]="0"(発売中)
+        session.meetings = [meeting]
+        session._s_fields = {}
+        session._post_text = Mock(return_value=response_html)
+        return session, meeting
+
+    def test_place_bets_session_expired_on_pw741(self):
+        # pw_741 がトップページ(g=730)を返した → セッション切れ（再ログイン可能）
+        html = '<FORM NAME="FORM0"><INPUT TYPE=HIDDEN NAME=uh VALUE="x">' \
+               '<INPUT TYPE=HIDDEN NAME=g VALUE="730"></FORM>'
+        session, meeting = self._place_bets_session(html)
+        with self.assertRaises(ipat_auto_bet.IpatSessionExpired):
+            session.place_bets(meeting, 7, [("馬連", (1, 2))], 100)
+
+    def test_place_bets_genuine_rejection_is_not_session_expired(self):
+        # pw_741 が確認ページ(g=741)を返したが受理0件 → 締切等の通常拒否。
+        # セッション切れではないので再ログイン対象にしない（無駄なリトライを防ぐ）
+        html = '<SCRIPT>Nb[0] = "0";</SCRIPT>' \
+               '<FORM NAME="FORM0"><INPUT TYPE=HIDDEN NAME=uh VALUE="x">' \
+               '<INPUT TYPE=HIDDEN NAME=inetid VALUE="i"><INPUT TYPE=HIDDEN NAME=g VALUE="741">' \
+               '<INPUT TYPE=HIDDEN NAME=t VALUE="123"></FORM>'
+        session, meeting = self._place_bets_session(html)
+        with self.assertRaises(ipat_auto_bet.IpatError) as cm:
+            session.place_bets(meeting, 7, [("馬連", (1, 2))], 100)
+        self.assertNotIsInstance(cm.exception, ipat_auto_bet.IpatSessionExpired)
 
 
 class SchedulePostTests(unittest.TestCase):

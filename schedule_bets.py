@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 
 from discord_webhook_url import DISCORD_SCHEDULE_WEBHOOK_URL, DISCORD_WEBHOOK_URL
 from fetch_odds import PLACE_NAMES, fetch_live_race_odds, normalize_race_id
+from ipat_auto_bet import IpatError, IpatSession, buy_race_bets
 from suggest_bets import Horse, suggest_for_race
 
 JST = timezone(timedelta(hours=9))
@@ -22,12 +23,14 @@ BASE_DIR = Path(__file__).resolve().parent
 NETKEIBA_URL = "https://race.netkeiba.com/race/shutuba.html"
 NETKEIBA_RESULT_URL = "https://race.netkeiba.com/race/result.html"
 RESULT_WAIT_MINUTES = 60  # 最終レース発走後に結果取得を待つ上限時間
+AUTO_BET_YEN = 100  # 自動購入の1点あたり金額
 
 @dataclass(frozen=True)
 class Race:
     race_id: str
     name: str
     start: datetime
+    is_obstacle: bool = False
 
     @property
     def short_label(self):
@@ -45,6 +48,14 @@ def discover_race_ids(predict_dir):
         if match:
             ids.add(normalize_race_id(match[1]))
     return sorted(ids)
+
+
+def is_obstacle_race(html):
+    """出馬表ページのレース条件に「障」（障害レース）が含まれるか判定する。
+    netkeiba では障害レースが「障3000m」のように表記される。"""
+    soup = BeautifulSoup(html, "html.parser")
+    data = soup.select_one(".RaceData01")
+    return bool(data and re.search(r"障(?:害)?[0-9]", data.get_text(" ", strip=True)))
 
 
 def parse_race_page(race_id, html):
@@ -71,7 +82,8 @@ def parse_race_page(race_id, html):
         raise ValueError("開催年とレースIDが一致しません")
     start = datetime.strptime(f"{date_str} {match[1]}:{match[2]}", "%Y%m%d %H:%M").replace(tzinfo=JST)
     title = soup.select_one(".RaceName")
-    return Race(race_id, title.get_text(" ", strip=True) if title else "", start)
+    obstacle = bool(data and re.search(r"障(?:害)?[0-9]", data.get_text(" ", strip=True)))
+    return Race(race_id, title.get_text(" ", strip=True) if title else "", start, obstacle)
 
 
 def fetch_schedule(race_id, session):
@@ -363,7 +375,36 @@ def summarize_day(races, webhook, base_dir=BASE_DIR, now=None, sleep=time.sleep)
     print("本日の回収率をDiscordに投稿しました", flush=True)
 
 
-def process_race(race, webhook, base_dir=BASE_DIR, now=None):
+def auto_bet_race(race, state, state_path, yen=AUTO_BET_YEN, session=None):
+    """提案済みの買い目をIPATで自動購入する。障害レースは購入しない。
+    結果メッセージ（Discord通知用）を返す。未実施なら None。"""
+    if state.get("auto_bet_done"):
+        return None
+    if race.is_obstacle:
+        state["auto_bet_done"] = True
+        state["auto_bet_result"] = "障害レースのため自動購入しません"
+        save_state(state_path, state)
+        print(f"[{race.race_id}] 障害レースのため自動購入スキップ", flush=True)
+        return None
+    bets = state.get("bets") or []
+    if not bets:
+        state["auto_bet_done"] = True
+        state["auto_bet_result"] = "買い目なしのため自動購入なし"
+        save_state(state_path, state)
+        return None
+    try:
+        points = buy_race_bets(race.race_id, bets, yen=yen, session=session)
+    except (IpatError, requests.RequestException, ValueError) as exc:
+        # 購入失敗は状態を保存せず、呼び出し側の再試行に委ねる
+        raise RuntimeError(f"自動購入失敗: {exc}") from None
+    state["auto_bet_done"] = True
+    state["auto_bet_result"] = f"IPATで {points}点 {points * yen:,}円を自動購入しました"
+    save_state(state_path, state)
+    print(f"[{race.race_id}] {state['auto_bet_result']}", flush=True)
+    return state["auto_bet_result"]
+
+
+def process_race(race, webhook, base_dir=BASE_DIR, now=None, auto_bet=False, ipat_session=None):
     now = now or (lambda: datetime.now(JST))
     state_path = Path(base_dir) / "suggestions" / "discord_state" / f"{race.race_id}.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
@@ -381,6 +422,11 @@ def process_race(race, webhook, base_dir=BASE_DIR, now=None):
             messages = build_messages(race, [], "予測CSV・最新オッズの取得または計算に失敗しました。ログを確認してください")
         state = {"messages": messages, "bets": bets, "sent": 0, "done": False}
         save_state(state_path, state)
+    if auto_bet and not state.get("auto_bet_done"):
+        result = auto_bet_race(race, state, state_path, session=ipat_session)
+        if result:
+            state["messages"] = state["messages"] + [result]
+            save_state(state_path, state)
     with requests.Session() as session:
         while state["sent"] < len(state["messages"]):
             if now() >= race.start:
@@ -399,6 +445,8 @@ def due(race, now):
 def main():
     parser = argparse.ArgumentParser(description="CSV_predictのレーススケジュールを別チャンネルに投稿し、発走5分前に買い目をDiscord通知、全レース終了後に本日の回収率を投稿（JST）")
     parser.add_argument("--list", action="store_true", help="発走日時を取得・表示して終了（送信なし）")
+    parser.add_argument("--auto-bet", action="store_true",
+                        help=f"提案した買い目をIPATで{AUTO_BET_YEN}円ずつ自動購入する（障害レースは除く）")
     args = parser.parse_args()
     webhook = None
     schedule_webhook = None
@@ -425,7 +473,8 @@ def main():
         for race_id in discover_race_ids(BASE_DIR / "CSV_predict"):
             try:
                 race = fetch_schedule(race_id, session)
-                print(f"{race.label} / 実行 {race.start - timedelta(minutes=5):%H:%M}", flush=True)
+                note = "（障害レース: 自動購入対象外）" if race.is_obstacle else ""
+                print(f"{race.label}{note} / 実行 {race.start - timedelta(minutes=5):%H:%M}", flush=True)
                 races.append(race)
             except Exception as exc:
                 print(f"[{race_id}] 発走日時取得失敗 ({type(exc).__name__})", flush=True)
@@ -439,6 +488,20 @@ def main():
         post_schedule(races, schedule_webhook)
     else:
         print("DISCORD_SCHEDULE_WEBHOOK_URL 未設定のためスケジュール投稿をスキップします", flush=True)
+    if args.auto_bet and any(race.is_obstacle for race in races):
+        print("障害レースは自動購入の対象外です", flush=True)
+    ipat_session = None
+    if args.auto_bet:
+        # 1日1回だけログインし、全レースの購入でセッションを共有する
+        # （セッション切れ時は buy_race_bets が再ログインして1回だけ再試行する）
+        ipat_session = IpatSession()
+        try:
+            ipat_session.login()
+        except Exception as exc:
+            raise SystemExit(
+                f"IPATログインに失敗しました ({type(exc).__name__}: {exc})。"
+                "ipat_login_info.py を確認してください。")
+        print("IPATにログインしました（自動購入モード）", flush=True)
     pending = {race.race_id: race for race in races if race.start > datetime.now(JST)}
     running = {}
     retry_at = {}
@@ -452,7 +515,7 @@ def main():
                         future.result()
                         pending.pop(race_id, None)
                     except Exception as exc:
-                        print(f"[{race_id}] 通知処理失敗 ({type(exc).__name__})。30秒後に再試行", flush=True)
+                        print(f"[{race_id}] 通知処理失敗 ({type(exc).__name__}: {exc})。30秒後に再試行", flush=True)
                         retry_at[race_id] = now + timedelta(seconds=30)
             for race_id, race in list(pending.items()):
                 if race_id in running:
@@ -461,9 +524,12 @@ def main():
                     print(f"[{race_id}] 発走済みのためスキップ", flush=True)
                     del pending[race_id]
                 elif due(race, now) and now >= retry_at.get(race_id, now):
-                    running[race_id] = executor.submit(process_race, race, webhook)
+                    running[race_id] = executor.submit(
+                        process_race, race, webhook, BASE_DIR, None, args.auto_bet, ipat_session)
             if pending or running:
                 time.sleep(1)
+    if ipat_session is not None:
+        ipat_session.close()
     summarize_day(races, webhook)
 
 

@@ -5,19 +5,19 @@ import time
 import re
 import os
 import unicodedata
-from datetime import date
+import argparse
+from datetime import date, datetime, timezone, timedelta
 
 # ============================================================
 # 設定
 # ============================================================
 
-TARGET_YEARS = [26]
-PLACES = [6,9]
-KAIS = [4]
-DAYS = [9]
-RACES = range(1, 13)
+# 取得対象日（YYYYMMDD）。None の場合は今日（JST）の日付を使用。
+# コマンドライン引数 --date YYYYMMDD でも指定可能。
+TARGET_DATE = None
 
 BASE_URL = "https://jiro8.sakura.ne.jp/index.php?code="
+NETKEIBA_RACE_LIST_URL = "https://race.netkeiba.com/top/race_list_sub.html"
 CSV_PREFIX = "horse_racing_data"
 
 # 既存CSVに今回追加する列がなければ、そのレースを再取得するか
@@ -498,10 +498,43 @@ def parse_race_html(html_content, url_code):
     return horses
 
 # ============================================================
+# レース一覧取得
+# ============================================================
+
+def fetch_race_codes_for_date(session, kaisai_date):
+    """netkeiba のレース一覧ページから、指定日(YYYYMMDD)に開催される
+    全レースのURLコード(10桁: yyppkkddrr)を取得する。
+
+    netkeiba の race_id は12桁(yyyyppkkddrr)で、先頭の "20" を除いた
+    10桁が jiro8.sakura.ne.jp のコードと同一になる。
+    開催がない日は空リストを返す。
+    """
+    res = session.get(NETKEIBA_RACE_LIST_URL, params={"kaisai_date": kaisai_date}, timeout=15)
+    res.raise_for_status()
+    res.encoding = "utf-8"
+    race_ids = sorted(set(re.findall(r"race_id=(\d{12})", res.text)))
+    return [rid[2:] for rid in race_ids]
+
+# ============================================================
 # メイン処理
 # ============================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="開催日の全レースCSVを CSV_predict に自動取得する")
+    parser.add_argument("--date", help="取得対象日 (YYYYMMDD)。省略時は今日(JST)")
+    args = parser.parse_args()
+
+    if args.date:
+        target_date = args.date
+        if not re.fullmatch(r"\d{8}", target_date):
+            print("エラー: --date は YYYYMMDD 形式で指定してください")
+            return
+    elif TARGET_DATE:
+        target_date = TARGET_DATE
+    else:
+        jst = timezone(timedelta(hours=9))
+        target_date = datetime.now(jst).strftime("%Y%m%d")
+
     required_columns = [
         "芝orダート", "距離", "回り", "馬場",
         "馬体重", "上がり3F順位", "ペース", "脚質", 
@@ -521,66 +554,66 @@ def main():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     })
 
-    for y in TARGET_YEARS:
-        print(f"\n=== {2000 + y}年の処理を開始します ===")
-        for p in PLACES:
-            for k in KAIS:
-                for d in DAYS:
-                    day_exists = False
-                    for r in RACES:
-                        code = f"{y:02d}{p:02d}{k:02d}{d:02d}{r:02d}"
-                        csv_file = os.path.join(csv_dir, f"{CSV_PREFIX}_{code}.csv")
-                        needs_scraping = True
+    print(f"対象日: {target_date}")
+    try:
+        codes = fetch_race_codes_for_date(session, target_date)
+    except Exception as e:
+        print(f"[レース一覧取得エラー] {e}")
+        return
 
-                        if os.path.exists(csv_file):
-                            try:
-                                if RESCRAPE_IF_COLUMNS_MISSING:
-                                    df = pd.read_csv(csv_file, nrows=0)
-                                    missing = [col for col in required_columns if col not in df.columns]
-                                    if not missing:
-                                        needs_scraping = False
-                                        day_exists = True
-                                        print(f"[既存・スキップ] {code}")
-                                    else:
-                                        print(f"[再取得] {code} (不足: {','.join(missing)})")
-                                else:
-                                    needs_scraping = False
-                                    day_exists = True
-                            except Exception as e:
-                                print(f"[CSV読込エラー] {csv_file}: {e}")
+    if not codes:
+        print("対象日に開催されるレースはありません（またはレース一覧を取得できませんでした）。")
+        return
 
-                        if not needs_scraping:
-                            continue
+    print(f"対象レース数: {len(codes)}")
+    for code in codes:
+        csv_file = os.path.join(csv_dir, f"{CSV_PREFIX}_{code}.csv")
+        needs_scraping = True
 
-                        url = BASE_URL + code
-                        time.sleep(REQUEST_INTERVAL_SECONDS)
+        if os.path.exists(csv_file):
+            try:
+                if RESCRAPE_IF_COLUMNS_MISSING:
+                    df = pd.read_csv(csv_file, nrows=0)
+                    missing = [col for col in required_columns if col not in df.columns]
+                    if not missing:
+                        needs_scraping = False
+                        print(f"[既存・スキップ] {code}")
+                    else:
+                        print(f"[再取得] {code} (不足: {','.join(missing)})")
+                else:
+                    needs_scraping = False
+            except Exception as e:
+                print(f"[CSV読込エラー] {csv_file}: {e}")
 
-                        try:
-                            res = session.get(url, timeout=15, allow_redirects=True)
-                            res.raise_for_status()
+        if not needs_scraping:
+            continue
 
-                            if f"code={code}" not in res.url:
-                                break
+        url = BASE_URL + code
+        time.sleep(REQUEST_INTERVAL_SECONDS)
 
-                            res.encoding = "cp932"
-                            match = re.search(r"dbcl2\(['\"]?(\d{10})['\"]?\)", res.text)
-                            if match and match.group(1) != code:
-                                break
+        try:
+            res = session.get(url, timeout=15, allow_redirects=True)
+            res.raise_for_status()
 
-                            horses = parse_race_html(res.text, code)
-                            if horses:
-                                pd.DataFrame(horses).to_csv(csv_file, index=False, encoding="utf-8-sig")
-                                day_exists = True
-                                print(f"[取得成功] {url} ({len(horses)}頭)")
-                            else:
-                                if r == 1:
-                                    break
-                        except Exception as e:
-                            print(f"[通信/処理エラー] {url} : {e}")
-                            time.sleep(5)
+            if f"code={code}" not in res.url:
+                print(f"[スキップ] {code} (リダイレクトされました: {res.url})")
+                continue
 
-                    if not day_exists:
-                        break
+            res.encoding = "cp932"
+            match = re.search(r"dbcl2\(['\"]?(\d{10})['\"]?\)", res.text)
+            if match and match.group(1) != code:
+                print(f"[スキップ] {code} (別コード {match.group(1)} のページが返されました)")
+                continue
+
+            horses = parse_race_html(res.text, code)
+            if horses:
+                pd.DataFrame(horses).to_csv(csv_file, index=False, encoding="utf-8-sig")
+                print(f"[取得成功] {url} ({len(horses)}頭)")
+            else:
+                print(f"[解析失敗] {url}")
+        except Exception as e:
+            print(f"[通信/処理エラー] {url} : {e}")
+            time.sleep(5)
 
     print("\n=== 全処理が完了しました ===")
 
