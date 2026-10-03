@@ -360,7 +360,7 @@ class AutoBetTests(unittest.TestCase):
         state = {"bets": [{"式別": "馬連", "買い目": "1-2"}], "messages": []}
         with patch.object(scheduler, "buy_race_bets", return_value=1) as buy:
             result = scheduler.auto_bet_race(self.race, state, self.state_path)
-        self.assertEqual(result, "IPATで 1点 100円を自動購入しました")
+        self.assertEqual(result, f"IPATで 1点 {scheduler.AUTO_BET_YEN}円を自動購入しました")
         buy.assert_called_once_with(self.race.race_id, state["bets"],
                                     yen=scheduler.AUTO_BET_YEN, session=None)
         self.assertTrue(state["auto_bet_done"])

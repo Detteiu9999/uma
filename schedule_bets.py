@@ -23,7 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent
 NETKEIBA_URL = "https://race.netkeiba.com/race/shutuba.html"
 NETKEIBA_RESULT_URL = "https://race.netkeiba.com/race/result.html"
 RESULT_WAIT_MINUTES = 60  # 最終レース発走後に結果取得を待つ上限時間
-AUTO_BET_YEN = 100  # 自動購入の1点あたり金額
+AUTO_BET_YEN = 200  # 自動購入の1点あたり金額
 
 @dataclass(frozen=True)
 class Race:
