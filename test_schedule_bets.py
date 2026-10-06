@@ -36,7 +36,7 @@ class ScheduleTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.race = scheduler.Race("202606040601", "テストレース", datetime(2026, 9, 20, 10, tzinfo=scheduler.JST))
-        self.now = lambda: self.race.start - timedelta(minutes=5)
+        self.now = lambda: self.race.start - timedelta(minutes=scheduler.NOTIFY_BEFORE_MINUTES)
         self.state_path = self.base / "suggestions" / "discord_state" / f"{self.race.race_id}.json"
         self.webhook = "https://discord.com/api/webhooks/123/secret"
 
@@ -292,7 +292,7 @@ class ResultSummaryTests(unittest.TestCase):
         odds = {"tanpuku": pd.DataFrame([{"馬番": 1, "単勝オッズ": 50, "複勝オッズ下限": 2}])}
         with patch.object(scheduler, "fetch_live_race_odds", return_value=odds), patch.object(scheduler, "send_discord"):
             scheduler.process_race(self.race1, self.webhook, self.base,
-                                   lambda: self.race1.start - timedelta(minutes=5))
+                                   lambda: self.race1.start - timedelta(minutes=scheduler.NOTIFY_BEFORE_MINUTES))
         state = json.loads((self.base / "suggestions" / "discord_state" / f"{self.race1.race_id}.json")
                            .read_text(encoding="utf-8"))
         self.assertEqual(state["bets"], [{"式別": "複勝", "買い目": "1 馬1", "的中確率(推定)": 0.7,
@@ -376,7 +376,7 @@ class AutoBetTests(unittest.TestCase):
     def test_process_race_auto_bet(self):
         ScheduleTests.predictions(self)
         odds = {"tanpuku": pd.DataFrame([{"馬番": 1, "単勝オッズ": 50, "複勝オッズ下限": 2}])}
-        now = lambda: self.race.start - timedelta(minutes=5)
+        now = lambda: self.race.start - timedelta(minutes=scheduler.NOTIFY_BEFORE_MINUTES)
         ipat_session = object()  # 共有セッションがそのまま buy_race_bets に渡ることを確認
         with patch.object(scheduler, "fetch_live_race_odds", return_value=odds), \
                 patch.object(scheduler, "send_discord") as send, \

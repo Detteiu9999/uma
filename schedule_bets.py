@@ -23,7 +23,8 @@ BASE_DIR = Path(__file__).resolve().parent
 NETKEIBA_URL = "https://race.netkeiba.com/race/shutuba.html"
 NETKEIBA_RESULT_URL = "https://race.netkeiba.com/race/result.html"
 RESULT_WAIT_MINUTES = 60  # 最終レース発走後に結果取得を待つ上限時間
-AUTO_BET_YEN = 200  # 自動購入の1点あたり金額
+AUTO_BET_YEN = 300  # 自動購入の1点あたり金額
+NOTIFY_BEFORE_MINUTES = 3  # 買い目通知・自動購入を行うタイミング（発走N分前）
 
 @dataclass(frozen=True)
 class Race:
@@ -439,11 +440,11 @@ def process_race(race, webhook, base_dir=BASE_DIR, now=None, auto_bet=False, ipa
 
 
 def due(race, now):
-    return race.start - timedelta(minutes=5) <= now < race.start
+    return race.start - timedelta(minutes=NOTIFY_BEFORE_MINUTES) <= now < race.start
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CSV_predictのレーススケジュールを別チャンネルに投稿し、発走5分前に買い目をDiscord通知、全レース終了後に本日の回収率を投稿（JST）")
+    parser = argparse.ArgumentParser(description=f"CSV_predictのレーススケジュールを別チャンネルに投稿し、発走{NOTIFY_BEFORE_MINUTES}分前に買い目をDiscord通知、全レース終了後に本日の回収率を投稿（JST）")
     parser.add_argument("--list", action="store_true", help="発走日時を取得・表示して終了（送信なし）")
     parser.add_argument("--auto-bet", action="store_true",
                         help=f"提案した買い目をIPATで{AUTO_BET_YEN}円ずつ自動購入する（障害レースは除く）")
@@ -474,7 +475,7 @@ def main():
             try:
                 race = fetch_schedule(race_id, session)
                 note = "（障害レース: 自動購入対象外）" if race.is_obstacle else ""
-                print(f"{race.label}{note} / 実行 {race.start - timedelta(minutes=5):%H:%M}", flush=True)
+                print(f"{race.label}{note} / 実行 {race.start - timedelta(minutes=NOTIFY_BEFORE_MINUTES):%H:%M}", flush=True)
                 races.append(race)
             except Exception as exc:
                 print(f"[{race_id}] 発走日時取得失敗 ({type(exc).__name__})", flush=True)

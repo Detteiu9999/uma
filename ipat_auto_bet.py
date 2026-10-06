@@ -43,7 +43,7 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
 
 MAX_BET_SLOTS = 255
-UNIT_YEN = 200  # 1点あたりの購入金額（デフォルト）
+UNIT_YEN = 300  # 1点あたりの購入金額（デフォルト）
 SESSION_MAX_IDLE_SECONDS = 15 * 60  # 共有セッションを使い回す上限（これを超えたら再ログイン）
 
 # 場コード（race_id の4-5桁目）→ IPAT 場コード文字
