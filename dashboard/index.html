@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>馬券購入成績</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script src="/dashboard.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <div><p class="eyebrow">UMA / BETTING REPORT</p><h1>馬券購入成績</h1><p class="muted">日々の購入記録と確定払戻を、ひとつの画面で。</p></div>
+    <div class="refresh"><button id="refresh" type="button">最新の情報に更新</button><label><input id="auto" type="checkbox" checked> 30秒ごとに自動更新</label><small id="updated">読み込み中…</small></div>
+  </header>
+  <section class="panel period-panel" aria-label="表示する月・年">
+    <div class="period-toolbar">
+      <div class="period-tabs" role="group" aria-label="表示単位">
+        <button type="button" data-period="month" aria-pressed="true">月ごと</button>
+        <button type="button" data-period="year" aria-pressed="false">年ごと</button>
+        <button type="button" data-period="all" aria-pressed="false">全期間</button>
+      </div>
+      <div class="period-shortcuts"><button id="this-month" type="button" class="secondary">今月</button><button id="this-year" type="button" class="secondary">今年</button></div>
+    </div>
+    <div class="period-navigation">
+      <div class="period-stepper"><button id="previous-period" type="button" class="secondary" aria-label="前の月">←</button><strong id="period-selection"></strong><button id="next-period" type="button" class="secondary" aria-label="次の月">→</button></div>
+      <label id="year-label">年を選択 <select id="year" aria-label="表示する年"></select></label>
+    </div>
+    <div id="months" class="month-buttons" role="group" aria-label="表示する月"></div>
+  </section>
+  <section class="panel filters" aria-label="集計条件">
+    <label>集計対象<select id="mode"><option value="actual">実購入（IPAT成功記録）</option><option value="simulation">通知買い目のシミュレーション</option></select></label>
+    <label id="stake-label" hidden>1点の仮定購入額（円）<input id="stake" type="number" min="100" max="1000000" step="100" value="100"></label>
+    <label>競馬場<select id="place"><option value="">すべて</option></select></label>
+    <label>式別<select id="type"><option value="">すべて</option><option>単勝</option><option>複勝</option><option>枠連</option><option>馬連</option><option>ワイド</option><option>馬単</option><option>3連複</option><option>3連単</option></select></label>
+    <button id="reset" class="secondary" type="button">絞り込みをリセット</button>
+  </section>
+  <p id="mode-note" class="note"></p>
+  <div id="error" class="error" role="alert" hidden></div>
+  <div id="sync" class="muted" role="status"></div>
+  <h2 id="report-period" aria-live="polite"></h2>
+  <section class="cards" aria-label="集計結果">
+    <article class="panel card"><h2>回収率</h2><strong id="roi">—</strong><small>確定払戻 ÷ 結果判明分の購入額</small></article>
+    <article class="panel card"><h2>回収額（確定払戻）</h2><strong id="returned">—</strong><small>的中した買い目の払戻合計</small></article>
+    <article class="panel card"><h2>収支（結果判明分）</h2><strong id="profit">—</strong><small>確定払戻 − 結果判明分の購入額</small></article>
+    <article class="panel card"><h2 id="purchased-title">購入総額</h2><strong id="purchased">—</strong><small id="settled">—</small></article>
+  </section>
+  <div class="facts"><span id="points"></span><span id="pending"></span><span id="source"></span></div>
+  <section class="panel chart-panel"><div class="section-heading"><h2>累計収支の推移</h2><span class="muted">選択期間内・結果判明分</span></div><div id="chart"></div></section>
+  <div class="breakdowns">
+    <section class="panel"><h2 id="breakdown-title">日別成績</h2><p id="breakdown-hint" class="muted" hidden></p><div class="table-scroll"><table><thead><tr><th id="breakdown-unit">開催日</th><th>判明購入額</th><th>回収額</th><th>収支</th><th>回収率</th><th>未判明額</th></tr></thead><tbody id="daily"></tbody></table></div></section>
+    <section class="panel"><h2>式別成績</h2><div class="table-scroll"><table><thead><tr><th>式別</th><th>的中 / 判明点数</th><th>判明購入額</th><th>回収額</th><th>回収率</th></tr></thead><tbody id="by-type"></tbody></table></div></section>
+  </div>
+  <section class="panel"><div class="section-heading"><h2>レース別明細</h2><span id="race-count" class="muted"></span></div><p class="muted">レースを開くと、買い目ごとの購入額・払戻額を確認できます。</p><div id="races"></div></section>
+  <details id="warnings-panel" class="panel" hidden><summary>読み込めなかった記録</summary><ul id="warnings"></ul></details>
+  <footer>データ元: suggestions/discord_state ・ 払戻: netkeibaの確定払戻テーブル（100円あたり）<br>結果未取得・未対応の返還／特払は未判明として扱います。回収率・収支の計算には結果判明分のみを使用します。</footer>
+</main>
+</body>
+</html>
